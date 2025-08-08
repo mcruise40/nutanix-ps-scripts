@@ -1,8 +1,10 @@
+$NutanixMoveIp = '10.0.0.1'
+$scriptUrl = 'https://' + $NutanixMoveIp + '/resources/uvm/win/esx_setup_uvm.ps1'
 
 Set-ExecutionPolicy Bypass -Scope Process -Force
 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-$scriptPath = (New-Object System.Net.WebClient).DownloadString('https://' + '10.40.205.250' + '/resources/uvm/win/esx_setup_uvm.ps1')
+$scriptPath = (New-Object System.Net.WebClient).DownloadString($scriptUrl)
 $retainIP = $true
 $installNgt = $true
 $installVirtio = $true
