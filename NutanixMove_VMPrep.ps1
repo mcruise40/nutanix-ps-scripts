@@ -13,4 +13,4 @@ $uninstallVMwareTools = $true
 $minPSVersion = '4.0.0'
 $virtIOVersion = '1.2.3.9'
 
-Invoke-Command -ScriptBlock ([scriptblock]::Create($scriptPath)) -ArgumentList '$NutanixMoveIp,$retainIP,$setSanPolicy,$installNgt,$minPSVersion,$installVirtio,$uninstallVMwareTools,$virtIOVersion
+Invoke-Command -ScriptBlock ([scriptblock]::Create($scriptPath)) -ArgumentList $NutanixMoveIp,$retainIP,$setSanPolicy,$installNgt,$minPSVersion,$installVirtio,$uninstallVMwareTools,$virtIOVersion
