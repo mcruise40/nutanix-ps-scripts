@@ -1,9 +1,12 @@
 <#
 .SYNOPSIS
-    Creates on-demand Recovery Points for a group of AHV VMs via Prism Central v4 API.
-    Target VMs are selected either by explicit name list, or by a Category key/value pair.
+    Creates on-demand Recovery Points for a group of AHV VMs via Prism Central v4 API,
+    one recovery point per VM. Target VMs are selected either by explicit name list, or
+    by a Category key/value pair.
 .NOTES
-    Max 32 combined VM + volume group entries per request (enforced in this script).
+    Always one API call per VM, for both crash-consistent and app-consistent (avoids the
+    API's 1-VM-per-request limit for app-consistent - error DP-10100 - and keeps behavior
+    uniform). A group failure/timeout on one VM does not stop the others; see summary line.
     Field schema for -AppConsistent is partially inferred, not fully confirmed - verify
     via developers.nutanix.com API reference before production use, not via PC's local
     REST API Explorer (v4 endpoints aren't published there).
@@ -22,25 +25,27 @@
     Category value (e.g. "Group1") used together with -CategoryKey to select all VMs
     tagged with that key/value pair. Mandatory for the 'ByCategory' parameter set.
 .PARAMETER RecoveryPointName
-    Name assigned to the created recovery point. Defaults to
-    "OnDemand-Group-<timestamp>" if not specified.
+    Name used as-is for every created recovery point (same name across all targeted VMs -
+    no VM suffix, since Prism Central's Data Protection view is already organized per-VM).
+    Defaults to "OnDemand-<timestamp>" if not specified.
 .PARAMETER RetentionDays
     Number of days until the recovery point expires and is eligible for cleanup.
     Default: 1 day.
 .PARAMETER ApiVersion
-    Nutanix v4 API revision to target (e.g. "v4.0", "v4.1"). Default: "v4.0". v4
+    Nutanix v4 API revision to target (e.g. "v4.2", "v4.3"). Default: "v4.2" (v4.3/v4.4
+    not supported in this environment's lab PC). v4
     revisions are documented as backward compatible within the v4 family, so this
     normally only needs to be changed to intentionally use a newer revision's features.
 .PARAMETER TimeoutSeconds
-    Maximum time (in seconds) to wait for the recovery-point creation task to finish
-    before the script stops polling and warns that the task may still be running.
+    Maximum time (in seconds) to wait for each recovery-point creation task to finish
+    before the script stops polling that task and warns it may still be running.
     Default: 600 seconds (10 minutes).
 .PARAMETER AppConsistent
-    If set, requests an application-consistent (VSS-based) recovery point instead of the
-    default crash-consistent one, by setting the top-level recoveryPointType field to
-    APPLICATION_CONSISTENT (confirmed enum value, official API Reference) and adding a
-    per-VM applicationConsistentProperties block. Only effective for Windows VMs with
-    NGT/VSS support (per Nutanix docs).
+    If set, requests application-consistent recovery points instead of the default
+    crash-consistent ones (sets recoveryPointType to APPLICATION_CONSISTENT). Requires NGT
+    on the guest: VSS on Windows, or /usr/local/sbin/pre_freeze + /usr/local/sbin/post_thaw
+    scripts on Linux; without these, Nutanix silently falls back to crash-consistent
+    (no error).
 .PARAMETER ProjectExtId
     Optional. External identifier of the project to associate with the recovery point.
     Documented as optional on the Create Recovery Point request; relevant mainly in
@@ -53,23 +58,23 @@
 .EXAMPLE
     .\New-NtnxGroupRecoveryPoint.ps1 -PcIp 10.0.0.10 -Credential $creds -VmNames "VM01","VM02"
 
-    Creates a recovery point for two explicitly named VMs, using default retention (1 day)
-    and default timeout (600 seconds).
+    Creates one crash-consistent recovery point per VM for two explicitly named VMs,
+    using default retention (1 day) and default timeout (600 seconds).
 .EXAMPLE
     .\New-NtnxGroupRecoveryPoint.ps1 -PcIp 10.0.0.10 -Credential $creds -CategoryKey "Patching" -CategoryValue "Group1" -WhatIf
 
     Dry run for all VMs tagged with category Patching:Group1 - shows which VMs would be
-    targeted without creating a recovery point.
+    targeted without creating anything.
 .EXAMPLE
-    .\New-NtnxGroupRecoveryPoint.ps1 -PcIp 10.0.0.10 -Credential $creds -CategoryKey "Patching" -CategoryValue "Group1" -RecoveryPointName "PrePatch-Group1" -RetentionDays 3 -TimeoutSeconds 900
+    .\New-NtnxGroupRecoveryPoint.ps1 -PcIp 10.0.0.10 -Credential $creds -CategoryKey "Patching" -CategoryValue "Group1" -RecoveryPointName "PrePatch" -RetentionDays 3 -TimeoutSeconds 900
 
-    Creates a recovery point for all VMs in category Patching:Group1, with a custom name,
-    3-day retention, and a 15-minute timeout for the task-polling loop.
+    Creates one recovery point named "PrePatch" for each VM in category Patching:Group1
+    (same name across all of them), with 3-day retention and a 15-minute per-VM task timeout.
 .EXAMPLE
-    .\New-NtnxGroupRecoveryPoint.ps1 -PcIp 10.0.0.10 -Credential $creds -VmNames "VM01" -AppConsistent -WhatIf
+    .\New-NtnxGroupRecoveryPoint.ps1 -PcIp 10.0.0.10 -Credential $creds -CategoryKey "Patching" -CategoryValue "Group1" -AppConsistent
 
-    Dry run requesting an application-consistent (VSS-based) recovery point for a single
-    named VM. Field placement for AppConsistent is unverified - test carefully.
+    Creates one application-consistent recovery point per VM in category Patching:Group1.
+    VMs without VSS/NGT prerequisites silently fall back to crash-consistent for that VM.
 #>
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium', DefaultParameterSetName = 'ByName')]
@@ -86,9 +91,9 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'ByCategory')]
     [string]$CategoryValue,
 
-    [string]$RecoveryPointName = "OnDemand-Group-$(Get-Date -Format 'yyyyMMdd-HHmmss')",
+    [string]$RecoveryPointName = "OnDemand-$(Get-Date -Format 'yyyyMMdd-HHmmss')",
     [int]$RetentionDays = 1,
-    [string]$ApiVersion = "v4.0",
+    [string]$ApiVersion = "v4.2",
     [int]$TimeoutSeconds = 600,
 
     # recoveryPointType is a top-level request field, not per-VM.
@@ -97,9 +102,6 @@ param(
     # Optional; only relevant in project-scoped / multi-tenant setups (e.g. Nutanix Central).
     [string]$ProjectExtId
 )
-
-# API limit: max 32 combined VM + volume group entries per request.
-$NtnxRecoveryPointMaxEntities = 32
 
 $PSDefaultParameterValues = @{ 'Invoke-RestMethod:SkipCertificateCheck' = $true }
 
@@ -157,6 +159,67 @@ function Get-AllNtnxVms {
     return $all
 }
 
+function New-NtnxRecoveryPoint {
+    # Builds the body, POSTs, and polls the task for ONE recovery point (one or more VMs).
+    # Returns $true on SUCCEEDED, $false otherwise (timeout, non-success task status).
+    param(
+        [Parameter(Mandatory)][array]$VmEntries,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$ExpirationTime,
+        [switch]$AppConsistent,
+        [string]$ProjectExtId
+    )
+
+    $body = @{
+        name              = $Name
+        expirationTime    = $ExpirationTime
+        recoveryPointType = if ($AppConsistent) { "APPLICATION_CONSISTENT" } else { "CRASH_CONSISTENT" }
+        # @(...) forces an array even with a single VM - see Get-AllNtnxVms note above.
+        vmRecoveryPoints  = @($VmEntries | ForEach-Object {
+            $spec = @{ vmExtId = $_.ExtId }
+            if ($AppConsistent) {
+                # 'writers' omitted: API rejects an empty array (minItems 1).
+                $spec.applicationConsistentProperties = @{
+                    '$objectType'          = 'dataprotection.v4.common.VssProperties'
+                    backupType             = 'FULL_BACKUP'
+                    shouldIncludeWriters   = $false
+                    shouldStoreVssMetadata = $false
+                }
+            }
+            $spec
+        })
+    }
+    if ($ProjectExtId) { $body.projectExtId = $ProjectExtId }
+
+    $createResponse = Invoke-NtnxApi -Method POST -Path "/dataprotection/$ApiVersion/config/recovery-points" -Body $body
+    $taskExtId = $createResponse.data.extId
+    if (-not $taskExtId) {
+        # Guard against a false-positive "SUCCEEDED" from polling the tasks collection
+        # without an ID (see task-polling loop below).
+        throw "No task extId returned. Response: $($createResponse | ConvertTo-Json -Depth 5)"
+    }
+    Write-Host "  Task: $taskExtId"
+
+    $vmLabel = ($VmEntries.Name -join ', ')
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        Start-Sleep -Seconds 5
+        $task = Invoke-NtnxApi -Method GET -Path "/prism/$ApiVersion/config/tasks/$taskExtId"
+        Write-Host "  Status: $($task.data.status)  Progress: $($task.data.progressPercentage)%"
+        if ($stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            Write-Warning "Timeout of $TimeoutSeconds seconds reached for task $taskExtId (VM: $vmLabel, name '$Name')."
+            return $false
+        }
+    } while ($task.data.status -in @("QUEUED", "RUNNING"))
+
+    if ($task.data.status -eq "SUCCEEDED") {
+        Write-Host "Recovery point '$Name' created successfully for VM: $vmLabel." -ForegroundColor Green
+        return $true
+    }
+    Write-Warning "Task for VM '$vmLabel' (recovery point '$Name') ended with status: $($task.data.status)"
+    return $false
+}
+
 # --- Resolve target VMs depending on parameter set (read-only - runs even under -WhatIf) ---
 $vmExtIds = @()
 
@@ -202,82 +265,44 @@ if ($PSCmdlet.ParameterSetName -eq 'ByName') {
 
 if (-not $vmExtIds) { throw "No matching VMs found - aborting." }
 
-if ($vmExtIds.Count -gt $NtnxRecoveryPointMaxEntities) {
-    throw "$($vmExtIds.Count) VMs matched, but the Nutanix v4 Create Recovery Point API " +
-          "accepts a maximum of $NtnxRecoveryPointMaxEntities entities (VMs + volume groups " +
-          "combined) per request - confirmed by the official API Reference. Narrow -VmNames, " +
-          "use a more specific Category, or split the group into multiple runs."
-}
-
-Write-Host "`nVMs targeted for recovery point '$RecoveryPointName':"
+Write-Host "`nVMs targeted:"
 $vmExtIds | Format-Table -AutoSize
 
-# --- Create the Recovery Point (state-changing, gated by ShouldProcess) ---
+# --- Build one recovery point job per VM (state-changing, gated by ShouldProcess) ---
+# Unified for both crash-consistent and app-consistent: one API call per VM, so
+# AppConsistent's API-enforced 1-VM-per-request limit (DP-10100) never applies, and
+# behavior is consistent regardless of -AppConsistent.
+# The recovery point Name is used as-is (no VM suffix) for every VM: Prism Central's
+# Data Protection > VM Recovery Points view is already organized per-VM (click a VM to
+# see its recovery points) - there is no flat cross-VM list where a name suffix would
+# aid identification, per direct confirmation from the environment's Prism Central UI.
 $expiration = (Get-Date).AddDays($RetentionDays).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-# Field schema per official Nutanix API Reference for Create Recovery Point; per-VM
-# fields (vmExtId, applicationConsistentProperties) inferred - verify before production.
-$body = @{
-    name              = $RecoveryPointName
-    expirationTime    = $expiration
-    recoveryPointType = if ($AppConsistent) { "APPLICATION_CONSISTENT" } else { "CRASH_CONSISTENT" }
-    vmRecoveryPoints  = $vmExtIds | ForEach-Object {
-        $spec = @{ vmExtId = $_.ExtId }
-        if ($AppConsistent) {
-            $spec.applicationConsistentProperties = @{
-                '$objectType'          = 'dataprotection.v4.common.VssProperties'
-                backupType             = 'FULL_BACKUP'
-                shouldIncludeWriters   = $false
-                writers                = @()
-                shouldStoreVssMetadata = $false
-            }
+$jobs = @($vmExtIds | ForEach-Object {
+    [pscustomobject]@{ Name = $RecoveryPointName; Vms = @($_) }
+})
+
+$results = foreach ($job in $jobs) {
+    $vmLabel = $job.Vms[0].Name
+    $targetDescription = "VM: $vmLabel"
+    Write-Host "`n--- VM: $vmLabel ---"
+
+    if ($PSCmdlet.ShouldProcess($targetDescription, "Create recovery point '$($job.Name)' (expires $expiration)")) {
+        try {
+            $success = New-NtnxRecoveryPoint -VmEntries $job.Vms -Name $job.Name -ExpirationTime $expiration `
+                -AppConsistent:$AppConsistent -ProjectExtId $ProjectExtId
+        } catch {
+            Write-Warning "Recovery point for VM '$vmLabel' failed: $($_.Exception.Message)"
+            $success = $false
         }
-        $spec
-    }
-}
-
-if ($ProjectExtId) {
-    $body.projectExtId = $ProjectExtId
-}
-
-$targetDescription = "$($vmExtIds.Count) VM(s): $($vmExtIds.Name -join ', ')"
-
-if ($PSCmdlet.ShouldProcess($targetDescription, "Create recovery point '$RecoveryPointName' (expires $expiration)")) {
-
-    $createResponse = Invoke-NtnxApi -Method POST -Path "/dataprotection/$ApiVersion/config/recovery-points" -Body $body
-    $taskExtId = $createResponse.data.extId
-
-    if (-not $taskExtId) {
-        # Defensive guard: if we ever reach this point with no task extId (e.g. an
-        # unexpected response shape), stop here rather than letting the polling loop
-        # below query the tasks collection without an ID - which previously returned
-        # ALL tasks and caused a false-positive "SUCCEEDED" due to PowerShell's -eq
-        # array-comparison behavior.
-        throw "Recovery point creation did not return a task extId - aborting before polling. Response: $($createResponse | ConvertTo-Json -Depth 5)"
-    }
-
-    Write-Host "Recovery point creation submitted. Task: $taskExtId"
-
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    do {
-        Start-Sleep -Seconds 5
-        $task = Invoke-NtnxApi -Method GET -Path "/prism/$ApiVersion/config/tasks/$taskExtId"
-        Write-Host "Status: $($task.data.status)  Progress: $($task.data.progressPercentage)%"
-
-        if ($stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
-            Write-Warning "Timeout of $TimeoutSeconds seconds reached while waiting for task $taskExtId. Task may still be running on the cluster - check Prism Central manually."
-            break
-        }
-    } while ($task.data.status -in @("QUEUED","RUNNING"))
-
-    if ($task.data.status -eq "SUCCEEDED") {
-        Write-Host "Recovery point '$RecoveryPointName' created successfully for $($vmExtIds.Count) VM(s)." -ForegroundColor Green
-    } elseif ($task.data.status -in @("QUEUED","RUNNING")) {
-        Write-Warning "Polling stopped due to timeout - task status was last seen as '$($task.data.status)'."
+        [pscustomobject]@{ Vm = $vmLabel; Name = $job.Name; Success = $success }
     } else {
-        Write-Warning "Task ended with status: $($task.data.status)"
-        $task.data | ConvertTo-Json -Depth 5
+        Write-Host "[WhatIf] No changes made for VM '$vmLabel' (recovery point '$($job.Name)')." -ForegroundColor Yellow
     }
-} else {
-    Write-Host "`n[WhatIf] No changes made. Above would have been the target VM set and payload." -ForegroundColor Yellow
+}
+
+if ($results) {
+    $succeeded = ($results | Where-Object Success).Count
+    $color = if ($succeeded -eq $results.Count) { 'Green' } else { 'Yellow' }
+    Write-Host "`n$succeeded of $($results.Count) tasks executed successfully." -ForegroundColor $color
 }
