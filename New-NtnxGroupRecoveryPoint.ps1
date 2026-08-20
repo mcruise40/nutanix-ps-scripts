@@ -3,33 +3,10 @@
     Creates on-demand Recovery Points for a group of AHV VMs via Prism Central v4 API.
     Target VMs are selected either by explicit name list, or by a Category key/value pair.
 .NOTES
-    Request body confirmed against the OFFICIAL Nutanix API Reference for the Create
-    Recovery Point endpoint (dataprotection v4.4, POST /dataprotection/v4.0/config/recovery-points):
-    name, expirationTime, recoveryPointType (top-level; enum CRASH_CONSISTENT /
-    APPLICATION_CONSISTENT), and optional projectExtId are all confirmed top-level fields.
-    Max 32 combined VM + volume group entries per request is a confirmed hard limit
-    (enforced in this script). Per-VM field names (vmExtId, applicationConsistentProperties,
-    backupType, etc.) and the "vmRecoveryPoints" array key are inferred from a separate,
-    matching RecoveryPoint object example in the same API reference - still recommended to
-    verify against your PC's REST API Explorer (Settings -> REST API Explorer, or
-    https://<pc-ip>:9440/api/dataprotection/v4.0/openapi) before production use.
-
-    v4 API revisions (v4.0, v4.1, v4.2, ...) are documented as backward compatible within the
-    v4 family (excluding EA releases), per official Nutanix.dev versioning docs. The ApiVersion
-    parameter lets you target a newer revision without editing the script body.
-
-    Name matching (ByName parameter set) is done case-insensitively via client-side comparison
-    (PowerShell -eq is case-insensitive by default), since tolower()/case-insensitive support in
-    the Nutanix v4 OData $filter is not confirmed in official docs - fetching all VMs and
-    matching locally is the safer, documented-compatible approach. VMs are paginated in pages
-    of 100 (the API's confirmed maximum $limit, observed directly from a live 400 error - not
-    documented anywhere) via Get-AllNtnxVms using $page (zero-based, confirmed via official
-    Nutanix.dev docs), covering all VMs regardless of cluster size.
-
-    All POST/PUT/DELETE calls send a mandatory Ntnx-Request-Id header (a fresh UUID per call)
-    for idempotency, per official Nutanix.dev docs ("Using Request ID Headers with Nutanix v4
-    APIs"). Invoke-NtnxApi wraps calls in try/catch and stops the script on API errors instead
-    of silently continuing with a $null response.
+    Max 32 combined VM + volume group entries per request (enforced in this script).
+    Field schema for -AppConsistent is partially inferred, not fully confirmed - verify
+    via developers.nutanix.com API reference before production use, not via PC's local
+    REST API Explorer (v4 endpoints aren't published there).
 .PARAMETER PcIp
     IP address or FQDN of the Prism Central instance (without https:// or port).
 .PARAMETER Credential
@@ -114,22 +91,14 @@ param(
     [string]$ApiVersion = "v4.0",
     [int]$TimeoutSeconds = 600,
 
-    # Confirmed against the official Nutanix API Reference for the Create Recovery Point
-    # endpoint (dataprotection v4.4, /dataprotection/v4.0/config/recovery-points POST):
-    # recoveryPointType is a top-level request field (enum: CRASH_CONSISTENT,
-    # APPLICATION_CONSISTENT), not per-VM as an earlier version of this script assumed.
+    # recoveryPointType is a top-level request field, not per-VM.
     [switch]$AppConsistent,
 
-    # Optional. projectExtId is documented as an optional top-level field on the Create
-    # Recovery Point request (not marked "required" in the official API reference, unlike
-    # the NTNX-Request-Id header). Only relevant in project-scoped / multi-tenant setups
-    # (e.g. Nutanix Central); omitted from the request body entirely if not supplied.
+    # Optional; only relevant in project-scoped / multi-tenant setups (e.g. Nutanix Central).
     [string]$ProjectExtId
 )
 
-# Hard limit confirmed by the official Nutanix API Reference for Create Recovery Point:
-# the combined vmRecoveryPoints + volumeGroupRecoveryPoints arrays accept 1-32 items.
-# This script only submits VMs, so the VM count alone must not exceed 32.
+# API limit: max 32 combined VM + volume group entries per request.
 $NtnxRecoveryPointMaxEntities = 32
 
 $PSDefaultParameterValues = @{ 'Invoke-RestMethod:SkipCertificateCheck' = $true }
@@ -142,12 +111,7 @@ $authHeader = @{
 }
 
 function Invoke-NtnxApi {
-    # Ntnx-Request-Id header is mandatory on nearly all POST/PUT/DELETE v4 API requests
-    # (idempotency token) - confirmed via official Nutanix.dev article "Using Request ID
-    # Headers with Nutanix v4 APIs" and the Nutanix v4 API User Guide. A new GUID is
-    # generated per call. SkipHeaderValidation avoids PowerShell rejecting the custom
-    # header format, per the official "Updating VMs with the Nutanix v4 APIs and
-    # PowerShell" Nutanix.dev article.
+    # Ntnx-Request-Id is mandatory on v4 POST/PUT/DELETE requests (idempotency token).
     param($Method, $Path, $Body)
 
     $headers = $authHeader.Clone()
@@ -178,15 +142,8 @@ function Invoke-NtnxApi {
 }
 
 function Get-AllNtnxVms {
-    # Paginated fetch of all VMs. Page size capped at 100 - confirmed against the
-    # live API (not documentation): a $limit above 100 on this endpoint returns
-    # HTTP 400 "Numeric instance is greater than the required maximum (maximum: 100)".
-    # Pagination parameter is $page (zero-based), NOT $offset - confirmed via the
-    # official Nutanix.dev article "Updating VMs with the Nutanix v4 APIs and
-    # PowerShell" and a Nutanix Community code sample, both of which use
-    # $page=<n>&$limit=100. Using $offset (as an earlier version of this script did)
-    # is silently ignored by the API, causing it to return the same first page every
-    # time - which looks like a near-infinite loop for any VM count above 100.
+    # Page size capped at 100 (API limit). Uses $page (zero-based), NOT $offset -
+    # $offset is silently ignored, causing an endless loop.
     param([int]$PageSize = 100)
 
     $all = @()
@@ -218,9 +175,7 @@ if ($PSCmdlet.ParameterSetName -eq 'ByName') {
     }
 
 } else {
-    # ByCategory: resolve the category extId first, then filter VMs client-side.
-    # 'categories' is not a documented $filter field on the VM list endpoint, so
-    # matching is done locally rather than via $filter on the VM query itself.
+    # ByCategory: resolve category extId first, then filter VMs client-side.
 
     $catFilter  = "key eq '$CategoryKey' and value eq '$CategoryValue'"
     $catEncoded = [uri]::EscapeDataString($catFilter)
@@ -260,25 +215,8 @@ $vmExtIds | Format-Table -AutoSize
 # --- Create the Recovery Point (state-changing, gated by ShouldProcess) ---
 $expiration = (Get-Date).AddDays($RetentionDays).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-# Body fields confirmed against the OFFICIAL Nutanix API Reference for the Create
-# Recovery Point endpoint itself (dataprotection v4.4, POST
-# /dataprotection/v4.0/config/recovery-points - not just a generic example):
-#   - name, expirationTime: top-level, as previously assumed.
-#   - recoveryPointType: TOP-LEVEL field (enum: CRASH_CONSISTENT, APPLICATION_CONSISTENT)
-#     - corrected from an earlier version of this script, which incorrectly placed a
-#       recoveryPointType per VM using the wrong enum value "APP_CONSISTENT".
-#   - projectExtId: optional top-level field, included only if -ProjectExtId is supplied.
-#   - Max 32 combined VM + volume group entries per request (enforced above).
-# STILL INFERRED (not verbatim shown in the official request-body field list, but
-# consistent with the separately-confirmed RecoveryPoint object representation):
-#   - The array container key itself for the request ("vmRecoveryPoints") - the official
-#     reference renders this field's name blank in the fetched text, but its description
-#     ("List of VM recovery point...") matches the "vmRecoveryPoints" key seen in the
-#     RecoveryPoint object example.
-#   - vmExtId as the per-entry VM reference field, and applicationConsistentProperties
-#     (with backupType, etc.) as an optional per-VM override when recoveryPointType is
-#     APPLICATION_CONSISTENT.
-# Verify against your PC's REST API Explorer before relying on this in production.
+# Field schema per official Nutanix API Reference for Create Recovery Point; per-VM
+# fields (vmExtId, applicationConsistentProperties) inferred - verify before production.
 $body = @{
     name              = $RecoveryPointName
     expirationTime    = $expiration
