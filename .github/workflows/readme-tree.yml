@@ -1,0 +1,32 @@
+name: Update README tree
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  tree:
+    runs-on: ubuntu-latest
+    name: readme-tree
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tree
+        uses: ./.github/actions/readme-tree
+        with:
+          showall: 'yes'
+          showdirectoryname: 'no'
+          showsize: 'no'
+          showallname: 'no'
+          ignoregit: 'yes'
+
+      - name: Commit
+        continue-on-error: true
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "github-actions"
+          git add README.md
+          git commit -m "docs: update readme tree [skip ci]" || exit 0
+          git push
