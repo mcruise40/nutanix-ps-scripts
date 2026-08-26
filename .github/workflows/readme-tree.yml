@@ -1,32 +1,21 @@
-name: Update README tree
-
-on:
-  push:
-    branches: [main]
+on: [push]
 
 jobs:
   tree:
     runs-on: ubuntu-latest
     name: readme-tree
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v3
       - name: Tree
-        uses: ./.github/actions/readme-tree
-        with:
-          showall: 'yes'
-          showdirectoryname: 'no'
-          showsize: 'no'
-          showallname: 'no'
-          ignoregit: 'yes'
-
-      - name: Commit
-        continue-on-error: true
+        uses: RavelloH/readme-tree@latest
+      - name: commit
+        continue-on-error: True
         run: |
+          git init
+          git pull
           git config --local user.email "actions@github.com"
           git config --local user.name "github-actions"
-          git add README.md
-          git commit -m "docs: update readme tree [skip ci]" || exit 0
-          git push
+          git add .
+          git commit -m "[Readme-Tree]`date '+%Y-%m-%d %H:%M:%S'`" || exit
+          git status
+          git push -f
