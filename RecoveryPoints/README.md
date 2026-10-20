@@ -115,7 +115,7 @@ What most environments need, in this order. Start every round with a dry run and
 |---|---|---|---|
 | 1 | `.\Invoke-NtnxRecoveryPointCleanup.ps1 -WhatIf -ExportCsv .\rp-list.csv` | `all`, then `y` | Dry run: nothing is deleted. Check `rp-list.csv` (Excel opens it directly). |
 | 2 | `.\Invoke-NtnxRecoveryPointCleanup.ps1` | `expired`, then type the count | Deletes recovery points that are past their expiry date but were not removed by Nutanix. Their VM still exists. |
-| 3 | `.\Invoke-NtnxRecoveryPointCleanup.ps1` | `missing 30`, then type the count | Deletes recovery points of VMs / volume groups that were deleted at least 30 days ago (newest recovery point older than 30 days). After this the deleted VMs cannot be restored anymore. |
+| 3 | `.\Invoke-NtnxRecoveryPointCleanup.ps1` | `missing 30`, then type the count | Deletes recovery points of VMs / volume groups that were deleted at least 30 days ago (no recovery point of the VM newer than 30 days). After this the deleted VMs cannot be restored anymore. |
 | 4 | `.\Invoke-NtnxRecoveryPointCleanup.ps1` | `d <row>`, then row numbers | Rows marked `VM replaced` and VMs deleted less than 30 days ago: check each one, select by number only if nobody needs it back. |
 | 5 | `.\Invoke-NtnxRecoveryPointCleanup.ps1 -StorageReport` (the next day) | - | Shows how much the used storage of each cluster changed since before the live runs, next to the space the script expected to free. Nothing is deleted. |
 
@@ -158,7 +158,7 @@ pwsh -ExecutionPolicy Bypass -File .\Invoke-NtnxRecoveryPointCleanup.ps1 -WhatIf
 | `-BatchSize` | Deletions started at the same time. Default: `5`. Use `2` if Prism Central keeps reporting its API rate limit |
 | `-StorageReport` | Only connects, shows the storage usage per cluster and the change since before the last live runs, then exits. Nothing is deleted |
 
-Supports `-WhatIf` (dry run: all steps, nothing deleted; log and CSVs are still written, status `Not deleted (dry run)`).
+Supports `-WhatIf` (dry run: all steps, nothing deleted; log and CSVs are still written, status `Not deleted (dry run)`) and `-Confirm` (asks before each deletion; recovery points answered with No are recorded as `Skipped (not confirmed)`).
 
 ```powershell
 .\Invoke-NtnxRecoveryPointCleanup.ps1
@@ -191,7 +191,7 @@ Before you confirm, step 4 shows how many of the selected recovery points have n
 | `1,4,7-12` | Rows by number |
 | `all` | Every row of the list from step 3, nothing else (see "What `all` deletes" below) |
 | `expired` / `missing` | All `Expired` rows / all `VM missing` and `VG missing` rows |
-| `missing 30` | `VM missing` and `VG missing` rows whose newest recovery point is older than 30 days (any number of days) |
+| `missing 30` | `VM missing` and `VG missing` rows whose VM / volume group has no recovery point newer than 30 days (any number of days). All its recovery points count, also ones in other rows or not listed (for example secure ones); `d <row>` shows the newest one if it is outside the row |
 | `d 5` | Show the individual recovery points of row 5 (PC, name, created, expires, space, ExtId) |
 | `list` / `csv` / `q` | Show the table again / export it to CSV / quit without deleting |
 

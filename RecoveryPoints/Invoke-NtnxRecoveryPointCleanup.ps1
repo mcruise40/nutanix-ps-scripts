@@ -41,7 +41,7 @@
       2. Live run, select "expired": recovery points past their expiry date that Nutanix
          did not remove.
       3. Live run, select "missing 30": recovery points of VMs / volume groups deleted at
-         least 30 days ago (newest recovery point older than 30 days).
+         least 30 days ago (no recovery point of the VM newer than 30 days).
       4. Rows marked "VM replaced" and recently deleted VMs: only by row number, after
          checking with "d <row>".
 .NOTES
@@ -653,6 +653,9 @@ function Show-RowDetail {
     Write-Host ("Row {0}: {1} ({2})" -f $Row.Row, $Row.Name, $Row.Reason) -ForegroundColor Cyan
     $ids = @($Row.Items[0].VmIds) + @($Row.Items[0].VgIds) | Where-Object { $_ }
     Write-Host ("IDs: {0}" -f ($ids -join ', '))
+    if ($Row.EntityNewestUtc -and $Row.NewestUtc -and $Row.EntityNewestUtc -gt $Row.NewestUtc) {
+        Write-Host ("Newest recovery point of this VM / volume group overall: {0} (in another row or not listed)" -f (Format-LocalDate $Row.EntityNewestUtc))
+    }
     $Row.Items | Sort-Object CreatedUtc | Format-Table -AutoSize -Property @(
         @{ Label = 'PC'; Expression = { $_.Pc.Label } }
         @{ Label = 'Recovery point'; Expression = { $_.RpName } }
@@ -721,8 +724,9 @@ function Add-Result {
         })
     $text = '{0}: {1} / {2} on {3}' -f $Status, $Item.Name, $Item.RpName, $Item.Pc.Label
     if ($Message) { $text += " - $Message" }
-    $ok = $Status -in 'Deleted', 'Already gone', 'Not deleted (dry run)'
-    Write-Host "  $text" -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
+    $ok = $Status -in 'Deleted', 'Already gone', 'Not deleted (dry run)', 'Skipped (not confirmed)'
+    $color = if ($Status -eq 'Skipped (not confirmed)') { 'Yellow' } elseif ($ok) { 'Green' } else { 'Red' }
+    Write-Host "  $text" -ForegroundColor $color
     Write-CleanupLog ('{0} [{1}] on {2}' -f $text, $Item.RpExtId, $Item.Pc.Address) $(if ($ok) { 'INFO' } else { 'ERROR' })
 }
 
@@ -1007,6 +1011,18 @@ foreach ($c in $noSize) {
 }
 Write-Progress -Activity 'Reading sizes' -Completed
 
+# Newest recovery point of each VM / volume group over all recovery points (also ones that are not listed, such as
+# secure ones), so "missing 30" judges a deleted VM by its last recovery point, not only by the row it is in.
+$newestById = @{}
+foreach ($entry in $rpEntries) {
+    $created = ConvertTo-UtcDate $entry.Rp.creationTime
+    if ($null -eq $created) { continue }
+    $ids = @(@($entry.Rp.vmRecoveryPoints) | ForEach-Object { $_.vmExtId }) + @(@($entry.Rp.volumeGroupRecoveryPoints) | ForEach-Object { $_.volumeGroupExtId })
+    foreach ($id in $ids) {
+        if ($id -and (-not $newestById.ContainsKey($id) -or $created -gt $newestById[$id])) { $newestById[$id] = $created }
+    }
+}
+
 # One row per VM / volume group and reason; missing VMs first.
 $reasonOrder = @{ 'VM missing' = 0; 'VG missing' = 1; 'VM replaced' = 2; 'Expired' = 3 }
 $rows = @($candidates | Group-Object GroupKey | ForEach-Object {
@@ -1014,6 +1030,7 @@ $rows = @($candidates | Group-Object GroupKey | ForEach-Object {
         $known = @($items | Where-Object { $null -ne $_.SizeBytes })
         $expiries = @($items | Where-Object { $_.ExpiresUtc } | ForEach-Object { $_.ExpiresUtc } | Sort-Object)
         $created = @($items | Where-Object { $_.CreatedUtc } | ForEach-Object { $_.CreatedUtc } | Sort-Object)
+        $entityNewest = @(@($items[0].VmIds) + @($items[0].VgIds) | Where-Object { $_ } | ForEach-Object { $newestById[$_] } | Where-Object { $_ } | Sort-Object)
         [pscustomobject]@{
             Row         = 0
             Reason      = $items[0].Reason
@@ -1022,6 +1039,8 @@ $rows = @($candidates | Group-Object GroupKey | ForEach-Object {
             Count       = $items.Count
             OldestUtc   = $created | Select-Object -First 1
             NewestUtc   = $created | Select-Object -Last 1
+            # Newest recovery point of the VMs / volume groups in this row, over all their recovery points.
+            EntityNewestUtc = if ($entityNewest.Count) { $entityNewest[-1] } else { $created | Select-Object -Last 1 }
             OverdueDays = if ($expiries.Count) { [int][Math]::Floor(($nowUtc - $expiries[0]).TotalDays) } else { 0 }
             SizeBytes   = if ($known.Count) { [int64]($known | Measure-Object -Property SizeBytes -Sum).Sum } else { $null }
             UnknownSize = $items.Count - $known.Count
@@ -1077,7 +1096,7 @@ function Show-SelectionHelp {
     Write-Host '  all          every row in the list above (also not yet expired ones of deleted VMs)'
     Write-Host '  expired      all rows with reason Expired'
     Write-Host '  missing      all rows with reason VM missing or VG missing'
-    Write-Host '  missing 30   the same, but only if the newest recovery point is older than 30 days'
+    Write-Host '  missing 30   the same, but only if the VM / volume group has no recovery point newer than 30 days'
     Write-Host '  d 5          show the recovery points of row 5'
     Write-Host '  list         show the table again'
     Write-Host '  csv          export the list to a CSV file'
@@ -1109,10 +1128,13 @@ Show-SelectionHelp
         '^all$' { $selectedRows = $rows }
         '^expired$' { $selectedRows = @($rows | Where-Object Reason -EQ 'Expired') }
         '^missing(?:\s+(\d+))?$' {
-            # "missing 30": leave out VMs / volume groups that still had a recovery point in the last 30 days.
+            # "missing 30": leave out VMs / volume groups that still had a recovery point in the last 30 days,
+            # counting all their recovery points (EntityNewestUtc), not only the ones in this row.
             $minDays = if ($Matches[1]) { [int]$Matches[1] } else { 0 }
             $selectedRows = @($rows | Where-Object {
-                    $_.Reason -like '*missing' -and ($minDays -eq 0 -or ($_.NewestUtc -and ($nowUtc - $_.NewestUtc).TotalDays -ge $minDays))
+                    $_.Reason -like '*missing' -and ($minDays -eq 0 -or (
+                            $_.NewestUtc -and ($nowUtc - $_.NewestUtc).TotalDays -ge $minDays -and
+                            $_.EntityNewestUtc -and ($nowUtc - $_.EntityNewestUtc).TotalDays -ge $minDays))
                 })
         }
         default {
@@ -1180,7 +1202,9 @@ try {
         foreach ($item in $batch) {
             $target = '{0} / {1} on {2} ({3})' -f $item.Name, $item.RpName, $item.Pc.Address, $item.RpExtId
             if (-not $PSCmdlet.ShouldProcess($target, 'Delete recovery point')) {
-                Add-Result $item 'Not deleted (dry run)' ''
+                # Dry run (-WhatIf), or "No" / "No to All" in a -Confirm prompt of a live run.
+                if ($script:DryRun) { Add-Result $item 'Not deleted (dry run)' '' }
+                else { Add-Result $item 'Skipped (not confirmed)' 'answered No in the confirmation prompt' }
                 $finishedCount++
                 continue
             }
@@ -1284,6 +1308,7 @@ try {
 }
 
 $gone = @($script:Results | Where-Object Status -EQ 'Already gone')
+$skippedByUser = @($script:Results | Where-Object Status -EQ 'Skipped (not confirmed)')
 $problems = @($script:Results | Where-Object Status -In 'Failed', 'Timeout', 'Not confirmed')
 Write-Host ''
 if ($script:DryRun) {
@@ -1293,6 +1318,7 @@ if ($script:DryRun) {
     Write-Host ' LIVE RUN finished ' -ForegroundColor White -BackgroundColor DarkRed
     Write-Host ("Deleted {0} of {1}, space to be freed: {2}." -f $deleted.Count, (Format-Count $queue.Count 'recovery point'), (Format-Total $deleted)) -ForegroundColor Cyan
     if ($gone.Count) { Write-Host ("{0} already gone (for example deleted together with a copy)." -f (Format-Count $gone.Count 'was' 'were')) }
+    if ($skippedByUser.Count) { Write-Host ("{0} skipped because you answered No in the confirmation prompt." -f (Format-Count $skippedByUser.Count 'recovery point')) -ForegroundColor Yellow }
     if ($problems.Count) {
         Write-Host "$($problems.Count) not deleted or not confirmed:" -ForegroundColor Red
         $problems | Format-Table -AutoSize -Wrap Status, Name, RecoveryPointName, PrismCentral, Message | Out-Host
@@ -1316,7 +1342,7 @@ if ($script:DryRun) {
 if ($script:RateLimitWaits) {
     Write-Host ("The API rate limit was reached {0}; the script waited and tried again." -f (Format-Count $script:RateLimitWaits 'time')) -ForegroundColor DarkYellow
 }
-Write-CleanupLog ("Finished ({0}): deleted={1}, already gone={2}, not deleted or not confirmed={3}, rate limit waits={4}" -f $script:Mode, $deleted.Count, $gone.Count, $problems.Count, $script:RateLimitWaits)
+Write-CleanupLog ("Finished ({0}): deleted={1}, already gone={2}, skipped by user={3}, not deleted or not confirmed={4}, rate limit waits={5}" -f $script:Mode, $deleted.Count, $gone.Count, $skippedByUser.Count, $problems.Count, $script:RateLimitWaits)
 Write-Host "Log:     $($script:LogFile)"
 Write-Host "Results: $resultsCsv"
 
