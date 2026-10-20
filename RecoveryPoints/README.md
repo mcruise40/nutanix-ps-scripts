@@ -119,7 +119,7 @@ What most environments need, in this order. Start every round with a dry run and
 | 4 | `.\Invoke-NtnxRecoveryPointCleanup.ps1` | `d <row>`, then row numbers | Rows marked `VM replaced` and VMs deleted less than 30 days ago: check each one, select by number only if nobody needs it back. |
 | 5 | `.\Invoke-NtnxRecoveryPointCleanup.ps1 -StorageReport` (the next day) | - | Shows how much the used storage of each cluster changed since before the live runs, next to the space the script expected to free. Nothing is deleted. |
 
-Afterwards, check the results CSV for `Failed` entries (open a Nutanix support case if expired recovery points cannot be deleted). The freed space shows up in Prism after the cluster's background cleanup (Curator), which can take several hours. Run every step from the same folder, so the storage history is in one place.
+Afterwards, check the results CSV for `Failed` entries (open a Nutanix support case if expired recovery points cannot be deleted). The freed space shows up in Prism after the cluster's background cleanup (Curator), usually within several hours to a day (see [Storage tracking](#storage-tracking)). Run every step from the same folder, so the storage history is in one place.
 
 ### Storage tracking
 
@@ -134,6 +134,8 @@ Compared with before the first of 2 live runs (2026-10-20 14:05):
 ```
 
 - **Used** is the cluster's `storageUsageBytes`, **logical** its `logicalStorageUsageBytes` (clustermgmt stats API). The expected value comes from the recovery points' exclusive usage. The API does not document whether these values include the extra data copies the cluster keeps for redundancy, so compare the trend rather than expecting the exact number.
+- **Timing:** a deleted recovery point disappears from Prism at once, and its task shows as succeeded. The data itself is only freed by the cluster's background cleanup (Curator), usually within several hours to a day. Check with `-StorageReport` the next day. Directly after a live run, used storage can even be slightly higher, because the clusters keep writing (VM writes, new recovery points, replication). The report says so when it runs within 24 hours of the deletion.
+- **No decrease after 36 hours:** check the last Curator scans on a CVM (`curator_cli get_last_successful_scans`) and the recycle bin in Prism, or open a case with Nutanix support. The report shows this hint as well.
 - Other changes on the cluster at the same time (new snapshots, growing or deleted VMs) are part of the difference.
 - If the storage cannot be read (no permission, older Prism Central), the script shows a warning and the cleanup works as before.
 

@@ -54,7 +54,7 @@
       could be reclaimed after deleting the recovery point. Totals are a lower bound: data
       shared only between several selected recovery points of the same VM is not counted
       for any single one. The space is freed once the cluster's background cleanup
-      (Curator) has run, which can take several hours.
+      (Curator) has run, usually within several hours to a day.
     - VM names of deleted VMs are read from the VM configuration stored in the recovery
       point (vmm vm-recovery-points API). If that fails, the row shows the VM ID instead.
     - Secure recovery points (isSecure) need an approval to be deleted and are skipped.
@@ -547,7 +547,9 @@ function Show-StorageComparison {
         return
     }
     $runCount = @($deletions | ForEach-Object { $_.RunId } | Select-Object -Unique).Count
-    $firstTime = Format-LocalDate (ConvertTo-UtcDate $baseline[0].TimeUtc)
+    $baselineUtc = ConvertTo-UtcDate $baseline[0].TimeUtc
+    $firstTime = Format-LocalDate $baselineUtc
+    $anyDecrease = $false
     Write-Host ''
     if ($runCount -eq 1) { Write-Host "Compared with before the live run on ${firstTime}:" -ForegroundColor Cyan }
     else { Write-Host "Compared with before the first of $runCount live runs ($firstTime):" -ForegroundColor Cyan }
@@ -564,6 +566,7 @@ function Show-StorageComparison {
                 Write-Host "    $($m.Cluster): no earlier value"
                 continue
             }
+            if ($m.UsedBytes -lt [int64]$before.UsedBytes) { $anyDecrease = $true }
             $text = '    {0}: used storage {1} (now {2})' -f $m.Cluster, (Format-Change ($m.UsedBytes - [int64]$before.UsedBytes)), (Format-Size $m.UsedBytes)
             if ($before.LogicalUsedBytes -and $null -ne $m.LogicalUsedBytes) {
                 $text += ', logical {0}' -f (Format-Change ($m.LogicalUsedBytes - [int64]$before.LogicalUsedBytes))
@@ -572,7 +575,19 @@ function Show-StorageComparison {
             Write-CleanupLog ("Storage change {0} {1} since {2}: {3}" -f $group.Name, $m.Cluster, $firstRun, $text.Trim())
         }
     }
-    Write-Host 'Space is freed by the cluster background cleanup, which can take hours. Other changes on the cluster count too.'
+    # A deleted recovery point is gone from Prism at once, but its data is only freed by Curator scans later.
+    $elapsed = [datetime]::UtcNow - $baselineUtc
+    if ($elapsed.TotalHours -lt 24) {
+        $since = if ($elapsed.TotalHours -lt 1) { Format-Count ([Math]::Max(1, [int]$elapsed.TotalMinutes)) 'minute' } else { Format-Count ([int][Math]::Floor($elapsed.TotalHours)) 'hour' }
+        Write-Host "Only $since since the deletion. The cluster frees the space in its background cleanup (Curator)," -ForegroundColor DarkYellow
+        Write-Host 'usually within several hours to a day. Until then, a small increase is normal: the clusters keep writing.' -ForegroundColor DarkYellow
+    } else {
+        Write-Host 'Space is freed by the cluster background cleanup (Curator). Other changes on the cluster count too.'
+        if (-not $anyDecrease -and $elapsed.TotalHours -ge 36) {
+            Write-Host 'No decrease after 36 hours: check the last Curator scans on a CVM (curator_cli get_last_successful_scans)' -ForegroundColor Yellow
+            Write-Host 'and the recycle bin in Prism, or open a case with Nutanix support.' -ForegroundColor Yellow
+        }
+    }
 }
 
 function Invoke-StorageCheck {
@@ -1121,7 +1136,7 @@ Show-SelectionHelp
         Write-Host ("Selected rows with reason VM replaced: {0}. Another VM has the same name; check with d <row> first." -f
             ($replacedRows.Row -join ', ')) -ForegroundColor Yellow
     }
-    Write-Host 'The space shows up as free once the cluster background cleanup has run (can take hours).'
+    Write-Host 'The space shows up as free once the cluster background cleanup has run (usually several hours to a day).'
     Write-Host ''
 
     if ($script:DryRun) {
