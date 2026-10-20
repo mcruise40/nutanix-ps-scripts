@@ -26,5 +26,5 @@ A collection of PowerShell scripts for operating and managing Nutanix environmen
 ```
 <!-- readme-tree end -->
 
-- **RecoveryPoints/** — on-demand recovery point management via the Prism Central v4 API.
+- **RecoveryPoints/** — on-demand recovery point management via the Prism Central v4 API, and a guided cleanup of expired or orphaned recovery points.
 - **Move/** — VM migration tooling: VirtIO driver check, Move VM preparation, and multi-server deployment of the prep script.
