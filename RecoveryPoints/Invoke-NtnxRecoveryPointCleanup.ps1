@@ -421,8 +421,13 @@ function Get-VmState {
 }
 
 function Get-VgState {
+    # A volume group only counts as missing if every Prism Central answers "not found". A Prism Central whose
+    # volume group list could not be read is not trusted: its 404 may mean the API is missing, not the volume group.
     param([object[]]$Pcs, [string]$VgExtId)
-    $answers = foreach ($pc in $Pcs) { Get-LookupAnswer -Pc $pc -Path "/volumes/$ApiVersion/config/volume-groups/$VgExtId" }
+    $answers = foreach ($pc in $Pcs) {
+        if ($pc.VgListOk) { Get-LookupAnswer -Pc $pc -Path "/volumes/$ApiVersion/config/volume-groups/$VgExtId" }
+        else { 'Unverified' }
+    }
     if ($answers -contains 'Exists') { return 'Exists' }
     if ($answers -contains 'Unverified') { return 'Unverified' }
     'Missing'
@@ -767,7 +772,7 @@ foreach ($address in $addresses) {
         }
     }
     $previous = $cred
-    $pcs.Add([pscustomobject]@{ Label = "PC$($pcs.Count + 1)"; Address = $address; Credential = $cred; EsxiListOk = $false })
+    $pcs.Add([pscustomobject]@{ Label = "PC$($pcs.Count + 1)"; Address = $address; Credential = $cred; EsxiListOk = $false; VgListOk = $false })
 }
 
 Write-Host ''
@@ -838,6 +843,7 @@ foreach ($pc in $pcs) {
     $vgs = @()
     try {
         $vgs = @(Get-NtnxList -Pc $pc -Path "/volumes/$ApiVersion/config/volume-groups" -Activity "$($pc.Label): reading volume groups")
+        $pc.VgListOk = $true
         foreach ($vg in $vgs) { if ($vg.extId) { $vgIndex[$vg.extId] = $vg.name } }
     } catch {
         $msg = "{0}: volume groups could not be read ({1}). Their recovery points are only offered if expired." -f $pc.Label, (Get-ApiError $_).Message
@@ -1163,73 +1169,122 @@ Write-CleanupLog ("{0} {1} recovery points, space {2}" -f $(if ($script:DryRun) 
 Write-Step 5 $(if ($script:DryRun) { 'Delete (simulated, nothing is deleted)' } else { 'Delete' })
 $queue = @($selectedItems | Sort-Object { $_.Pc.Label }, Name, CreatedUtc)
 $finishedCount = 0
-for ($start = 0; $start -lt $queue.Count; $start += $BatchSize) {
-    $batch = $queue[$start..([Math]::Min($start + $BatchSize, $queue.Count) - 1)]
-    $running = [System.Collections.Generic.List[object]]::new()
+$running = [System.Collections.Generic.List[object]]::new()
+$resultsCsv = $script:LogFile -replace '\.log$', '_results.csv'
+$completed = $false
+try {
+    for ($start = 0; $start -lt $queue.Count; $start += $BatchSize) {
+        $batch = $queue[$start..([Math]::Min($start + $BatchSize, $queue.Count) - 1)]
+        $running.Clear()
 
-    foreach ($item in $batch) {
-        $target = '{0} / {1} on {2} ({3})' -f $item.Name, $item.RpName, $item.Pc.Address, $item.RpExtId
-        if (-not $PSCmdlet.ShouldProcess($target, 'Delete recovery point')) {
-            Add-Result $item 'Not deleted (dry run)' ''
-            $finishedCount++
-            continue
-        }
-        try {
-            $response = Invoke-NtnxApi -Pc $item.Pc -Method DELETE -Path "/dataprotection/$ApiVersion/config/recovery-points/$($item.RpExtId)"
-            $taskId = $response.data.extId
-            if ($taskId) {
-                $running.Add([pscustomobject]@{ Item = $item; TaskId = $taskId; Started = [datetime]::UtcNow })
-            } else {
-                Add-Result $item 'Failed' 'No task ID returned'
+        foreach ($item in $batch) {
+            $target = '{0} / {1} on {2} ({3})' -f $item.Name, $item.RpName, $item.Pc.Address, $item.RpExtId
+            if (-not $PSCmdlet.ShouldProcess($target, 'Delete recovery point')) {
+                Add-Result $item 'Not deleted (dry run)' ''
                 $finishedCount++
-            }
-        } catch {
-            $err = Get-ApiError $_
-            if ($err.StatusCode -eq 404) { Add-Result $item 'Already gone' 'not found, deleted in the meantime' }
-            else { Add-Result $item 'Failed' $err.Message }
-            $finishedCount++
-        }
-        Start-Sleep -Milliseconds 500   # spread the deletions, Prism Central rate-limits its API
-    }
-
-    while ($running.Count) {
-        Start-Sleep -Seconds 5
-        foreach ($run in @($running)) {
-            $elapsed = ([datetime]::UtcNow - $run.Started).TotalSeconds
-            try {
-                $task = (Invoke-NtnxApi -Pc $run.Item.Pc -Path "/prism/$ApiVersion/config/tasks/$($run.TaskId)").data
-            } catch {
-                $task = $null
-            }
-            if ($null -eq $task -or $task.status -in 'QUEUED', 'RUNNING', 'CANCELING') {
-                if ($elapsed -ge $TimeoutSeconds) {
-                    Add-Result $run.Item 'Timeout' "task $($run.TaskId) not finished after $TimeoutSeconds s, check it in Prism Central"
-                    [void]$running.Remove($run)
-                    $finishedCount++
-                }
                 continue
             }
-            if ($task.status -eq 'SUCCEEDED') {
-                Add-Result $run.Item 'Deleted' ''
-            } else {
-                $detail = @($task.errorMessages | ForEach-Object { $_.message } | Where-Object { $_ }) -join '; '
-                if (-not $detail) { $detail = @($task.legacyErrorMessage) -join '; ' }
-                Add-Result $run.Item 'Failed' ("task {0}: {1}" -f $task.status, $detail)
+            try {
+                $response = Invoke-NtnxApi -Pc $item.Pc -Method DELETE -Path "/dataprotection/$ApiVersion/config/recovery-points/$($item.RpExtId)"
+                $taskId = $response.data.extId
+                if ($taskId) {
+                    $running.Add([pscustomobject]@{ Item = $item; TaskId = $taskId; Started = [datetime]::UtcNow; PollErrors = 0 })
+                } else {
+                    Add-Result $item 'Failed' 'No task ID returned'
+                    $finishedCount++
+                }
+            } catch {
+                $err = Get-ApiError $_
+                if ($err.StatusCode -eq 404) { Add-Result $item 'Already gone' 'not found, deleted in the meantime' }
+                else { Add-Result $item 'Failed' $err.Message }
+                $finishedCount++
             }
-            [void]$running.Remove($run)
-            $finishedCount++
+            Start-Sleep -Milliseconds 500   # spread the deletions, Prism Central rate-limits its API
         }
-        Write-Progress -Activity 'Deleting recovery points' -Status "$finishedCount of $($queue.Count) finished" -PercentComplete (100 * $finishedCount / $queue.Count)
+
+        while ($running.Count) {
+            Start-Sleep -Seconds 5
+            foreach ($run in @($running)) {
+                $elapsed = ([datetime]::UtcNow - $run.Started).TotalSeconds
+                $rpPath = "/dataprotection/$ApiVersion/config/recovery-points/$($run.Item.RpExtId)"
+                $task = $null
+                try {
+                    $task = (Invoke-NtnxApi -Pc $run.Item.Pc -Path "/prism/$ApiVersion/config/tasks/$($run.TaskId)").data
+                    $run.PollErrors = 0
+                } catch {
+                    # Task status not readable: log it, and after 3 tries check the recovery point itself.
+                    $run.PollErrors++
+                    $pollError = (Get-ApiError $_).Message
+                    if ($run.PollErrors -eq 1) {
+                        Write-CleanupLog ("Task status for {0} could not be read: {1}" -f $run.Item.RpExtId, $pollError) 'WARN'
+                    }
+                    if ($run.PollErrors -ge 3 -and (Get-LookupAnswer -Pc $run.Item.Pc -Path $rpPath) -eq 'Missing') {
+                        Add-Result $run.Item 'Deleted' "task status could not be read ($pollError), but the recovery point no longer exists"
+                        [void]$running.Remove($run)
+                        $finishedCount++
+                        continue
+                    }
+                }
+                if ($null -eq $task -or $task.status -in 'QUEUED', 'RUNNING', 'CANCELING') {
+                    if ($elapsed -ge $TimeoutSeconds) {
+                        # Not reported as finished in time: check whether the recovery point is gone anyway.
+                        switch (Get-LookupAnswer -Pc $run.Item.Pc -Path $rpPath) {
+                            'Missing' { $status = 'Deleted'; $message = "task $($run.TaskId) not reported as finished after $TimeoutSeconds s, but the recovery point no longer exists" }
+                            'Exists' { $status = 'Timeout'; $message = "task $($run.TaskId) not finished after $TimeoutSeconds s and the recovery point still exists; check the task in Prism Central" }
+                            default { $status = 'Timeout'; $message = "task $($run.TaskId) not finished after $TimeoutSeconds s and the recovery point could not be checked; check the task in Prism Central" }
+                        }
+                        Add-Result $run.Item $status $message
+                        [void]$running.Remove($run)
+                        $finishedCount++
+                    }
+                    continue
+                }
+                if ($task.status -eq 'SUCCEEDED') {
+                    Add-Result $run.Item 'Deleted' ''
+                } else {
+                    $detail = @($task.errorMessages | ForEach-Object { $_.message } | Where-Object { $_ }) -join '; '
+                    if (-not $detail) { $detail = @($task.legacyErrorMessage) -join '; ' }
+                    Add-Result $run.Item 'Failed' ("task {0}: {1}" -f $task.status, $detail)
+                }
+                [void]$running.Remove($run)
+                $finishedCount++
+            }
+            Write-Progress -Activity 'Deleting recovery points' -Status "$finishedCount of $($queue.Count) finished" -PercentComplete (100 * $finishedCount / $queue.Count)
+        }
+    }
+    $completed = $true
+} finally {
+    # Runs also after Ctrl+C or an unexpected error: whatever was deleted must end up in the results CSV and the storage history.
+    Write-Progress -Activity 'Deleting recovery points' -Completed
+    if (-not $completed) {
+        foreach ($run in @($running)) {
+            Add-Result $run.Item 'Not confirmed' 'the deletion was started, but the run stopped before it finished; check it in Prism Central'
+        }
+        $notConfirmed = $running.Count
+        $notStarted = $queue.Count - $script:Results.Count
+        $stopText = 'Run stopped before the end: {0} of {1} finished, {2} not confirmed, {3} not started. The results so far are saved.' -f
+            ($script:Results.Count - $notConfirmed), (Format-Count $queue.Count 'recovery point'), $notConfirmed, $notStarted
+        Write-Host ''
+        Write-Host $stopText -ForegroundColor Yellow
+        Write-CleanupLog $stopText 'WARN'
+    }
+    $script:Results | Export-Csv -LiteralPath $resultsCsv -NoTypeInformation -UseCulture -Encoding utf8BOM -WhatIf:$false -Confirm:$false
+    $deleted = @($script:Results | Where-Object Status -EQ 'Deleted')
+    if (-not $script:DryRun -and $deleted.Count) {
+        # Recorded so later runs can compare the storage with the state before this deletion.
+        Add-StorageHistory @($deleted | Group-Object PrismCentral | ForEach-Object {
+                $freed = ($_.Group | Where-Object { $null -ne $_.SizeBytes } | Measure-Object -Property SizeBytes -Sum).Sum
+                ConvertTo-StorageRow -EventName 'Deleted' -PrismCentral $_.Name -DeletedCount $_.Count -FreedAtLeastBytes ([int64]$freed)
+            })
+    }
+    if (-not $completed) {
+        Write-Host "Log:     $($script:LogFile)"
+        Write-Host "Results: $resultsCsv"
     }
 }
-Write-Progress -Activity 'Deleting recovery points' -Completed
 
-$resultsCsv = $script:LogFile -replace '\.log$', '_results.csv'
-$script:Results | Export-Csv -LiteralPath $resultsCsv -NoTypeInformation -UseCulture -Encoding utf8BOM -WhatIf:$false -Confirm:$false
-
-$deleted = @($script:Results | Where-Object Status -EQ 'Deleted')
 $gone = @($script:Results | Where-Object Status -EQ 'Already gone')
-$problems = @($script:Results | Where-Object Status -In 'Failed', 'Timeout')
+$problems = @($script:Results | Where-Object Status -In 'Failed', 'Timeout', 'Not confirmed')
 Write-Host ''
 if ($script:DryRun) {
     Write-Host ' DRY RUN finished: nothing was deleted. ' -ForegroundColor Black -BackgroundColor Yellow
@@ -1239,20 +1294,21 @@ if ($script:DryRun) {
     Write-Host ("Deleted {0} of {1}, space to be freed: {2}." -f $deleted.Count, (Format-Count $queue.Count 'recovery point'), (Format-Total $deleted)) -ForegroundColor Cyan
     if ($gone.Count) { Write-Host ("{0} already gone (for example deleted together with a copy)." -f (Format-Count $gone.Count 'was' 'were')) }
     if ($problems.Count) {
-        Write-Host "$($problems.Count) could not be deleted:" -ForegroundColor Red
+        Write-Host "$($problems.Count) not deleted or not confirmed:" -ForegroundColor Red
         $problems | Format-Table -AutoSize -Wrap Status, Name, RecoveryPointName, PrismCentral, Message | Out-Host
-        Write-Host 'These still exist and are listed again in the next run, so you can simply run the script again.'
+        if ($problems.Status -contains 'Failed') {
+            Write-Host 'Failed: these still exist and are listed again in the next run, so you can simply run the script again.'
+        }
+        if ($problems.Status -contains 'Timeout') {
+            Write-Host 'Timeout: the deletion was started but not confirmed in time. Check the tasks in Prism Central;'
+            Write-Host 'whatever still exists is listed again in the next run.'
+        }
         if ($problems.Message -match 'rate limit') {
             Write-Host 'Some failed because of the API rate limit: run it again with -BatchSize 2.' -ForegroundColor Yellow
         }
         Write-Host 'If expired recovery points keep failing for other reasons, open a case with Nutanix support.'
     }
     if ($deleted.Count) {
-        # Recorded so later runs can compare the storage with the state before this deletion.
-        Add-StorageHistory @($deleted | Group-Object PrismCentral | ForEach-Object {
-                $freed = ($_.Group | Where-Object { $null -ne $_.SizeBytes } | Measure-Object -Property SizeBytes -Sum).Sum
-                ConvertTo-StorageRow -EventName 'Deleted' -PrismCentral $_.Name -DeletedCount $_.Count -FreedAtLeastBytes ([int64]$freed)
-            })
         Write-Host 'To see how much space was actually freed, run this tomorrow from the same folder:' -ForegroundColor Cyan
         Write-Host '  .\Invoke-NtnxRecoveryPointCleanup.ps1 -StorageReport' -ForegroundColor Cyan
     }
@@ -1260,7 +1316,7 @@ if ($script:DryRun) {
 if ($script:RateLimitWaits) {
     Write-Host ("The API rate limit was reached {0}; the script waited and tried again." -f (Format-Count $script:RateLimitWaits 'time')) -ForegroundColor DarkYellow
 }
-Write-CleanupLog ("Finished ({0}): deleted={1}, already gone={2}, failed={3}, rate limit waits={4}" -f $script:Mode, $deleted.Count, $gone.Count, $problems.Count, $script:RateLimitWaits)
+Write-CleanupLog ("Finished ({0}): deleted={1}, already gone={2}, not deleted or not confirmed={3}, rate limit waits={4}" -f $script:Mode, $deleted.Count, $gone.Count, $problems.Count, $script:RateLimitWaits)
 Write-Host "Log:     $($script:LogFile)"
 Write-Host "Results: $resultsCsv"
 
