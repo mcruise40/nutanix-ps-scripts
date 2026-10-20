@@ -164,6 +164,7 @@ Supports `-WhatIf` (dry run: all steps, nothing deleted; log and CSVs are still 
 .\Invoke-NtnxRecoveryPointCleanup.ps1
 .\Invoke-NtnxRecoveryPointCleanup.ps1 -PrismCentral pc-a.example.local, pc-b.example.local
 .\Invoke-NtnxRecoveryPointCleanup.ps1 -PrismCentral 10.0.20.10, 10.0.30.10 -ExportCsv .\rp.csv -WhatIf
+.\Invoke-NtnxRecoveryPointCleanup.ps1 -PrismCentral 10.0.20.10, 10.0.30.10 -StorageReport
 ```
 
 **Which recovery points are offered:**

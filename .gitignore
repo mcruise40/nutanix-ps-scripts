@@ -1,0 +1,4 @@
+# Output of RecoveryPoints/Invoke-NtnxRecoveryPointCleanup.ps1 when it is run inside the repo.
+# Logs and CSVs contain Prism Central addresses, cluster and VM names.
+RecoveryPointCleanup_*
+rp-list*.csv

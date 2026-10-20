@@ -1,4 +1,3 @@
-#Requires -Version 7.0
 <#
 .SYNOPSIS
     Guided cleanup of Nutanix recovery points that are expired or whose VM / volume group
@@ -8,17 +7,20 @@
 
       1. Connect  - asks how many Prism Centrals to check, their addresses and logins, and
                     checks every login before anything else happens.
-      2. Collect  - reads VMs, volume groups and recovery points from all Prism Centrals.
+      2. Collect  - reads VMs, volume groups and recovery points from all Prism Centrals,
+                    and the storage usage of their clusters (see Notes).
       3. Review   - lists one row per VM / volume group with the reason, the Prism
                     Central(s), the number of recovery points and the space they hold.
                     The list can be exported to CSV.
       4. Select   - pick rows by number (1,4,7-12), by reason (expired / missing) or all.
                     "all" means every row of the list from step 3, nothing else.
       5. Delete   - shows the total, asks you to type the number of recovery points to
-                    confirm, deletes them and writes a log file.
+                    confirm, deletes them and writes a log file and a results CSV.
 
     The mode is shown at the start and in every step title: [DRY RUN] with -WhatIf
-    (nothing is deleted), otherwise [LIVE]. Log files are named ..._DRYRUN / ..._LIVE.
+    (nothing is deleted), [STORAGE REPORT] with -StorageReport (only steps 1 and 2,
+    nothing is deleted), otherwise [LIVE]. Log files are named ..._DRYRUN / ..._REPORT /
+    ..._LIVE.
 
     A recovery point is offered for deletion when one of these applies:
       - VM missing / VG missing: none of the VMs or volume groups it contains exist on any
@@ -116,6 +118,8 @@
     A day after a live run: shows how much the used storage changed since before the
     deletion, next to the space the script expected to free.
 #>
+
+#Requires -Version 7.0
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
