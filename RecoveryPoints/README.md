@@ -130,10 +130,11 @@ Each run, and `-StorageReport`, compares the current usage with the usage measur
 ```
 Compared with before the first of 2 live runs (2026-10-20 14:05):
   PC1 pc-a.example.local: 86 recovery points deleted, expected to free at least 2.9 TiB
-    cluster-a: used storage down by 5.6 TiB (now 41.2 TiB), logical down by 2.8 TiB
+    cluster-a: used storage down by 3.3 TiB (now 41.2 TiB), logical down by 6.1 TiB
 ```
 
-- **Used** is the cluster's `storageUsageBytes`, **logical** its `logicalStorageUsageBytes` (clustermgmt stats API). The expected value comes from the recovery points' exclusive usage. The API does not document whether these values include the extra data copies the cluster keeps for redundancy, so compare the trend rather than expecting the exact number.
+- **Used** is the cluster's `storageUsageBytes` (clustermgmt stats API), the disk space the data actually takes up. Compare the expected value with this number. Used storage usually drops by more than expected: the expected value comes from the recovery points' exclusive usage, which does not count data shared between several of the deleted recovery points, but that data is freed too.
+- **Logical** is the cluster's `logicalStorageUsageBytes`. It is typically close to twice the used storage, for the total as well as for the freed space, most likely because it counts the data before compression and deduplication. The API does not document either value in detail, so compare the trend rather than expecting an exact match.
 - **Timing:** a deleted recovery point disappears from Prism at once, and its task shows as succeeded. The data itself is only freed by the cluster's background cleanup (Curator), usually within several hours to a day. Check with `-StorageReport` the next day. Directly after a live run, used storage can even be slightly higher, because the clusters keep writing (VM writes, new recovery points, replication). The report says so when it runs within 24 hours of the deletion.
 - **No decrease after 36 hours:** check the last Curator scans on a CVM (`curator_cli get_last_successful_scans`) and the recycle bin in Prism, or open a case with Nutanix support. The report shows this hint as well.
 - Other changes on the cluster at the same time (new snapshots, growing or deleted VMs) are part of the difference.

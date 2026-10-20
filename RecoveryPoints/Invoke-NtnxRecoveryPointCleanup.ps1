@@ -68,8 +68,11 @@
       storageUsageBytes, logicalStorageUsageBytes, storageCapacityBytes) and appends it to
       RecoveryPointCleanup_storage-history.csv in the log folder. Live runs also record how
       much they expected to free. Each run (and -StorageReport) compares the current usage
-      with the usage before the live runs of the last 30 days. Other changes on the cluster
-      (new snapshots, growing VMs) are part of the difference too.
+      with the usage before the live runs of the last 30 days. Compare the expected value
+      with used storage, which usually drops by more. Logical usage is typically close to
+      twice the used storage, most likely because it counts data before compression and
+      deduplication. Other changes on the cluster (new snapshots, growing VMs) are part of
+      the difference too.
     - Deletion is irreversible. Run with -WhatIf for a dry run.
     - Certificate validation is disabled (SkipCertificateCheck), like the other scripts in
       this folder.
