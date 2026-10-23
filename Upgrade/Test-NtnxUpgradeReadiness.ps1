@@ -9,9 +9,10 @@
       1. Cluster and host state      - no upgrade running, no host already in maintenance
       2. Data resiliency             - current fault tolerance >= configured fault tolerance
       3. Storage                     - usage in percent of the resilient capacity
-      4. HA reservation              - memory reserved for a host failure (Guarantee mode)
-      5. Memory with N-1             - memory allotted to running VMs vs. capacity without
-                                       the largest host
+      4. HA reservation              - memory reserved for a host failure (Guarantee mode,
+                                       only exposed from API v4.3 on; INFO otherwise)
+      5. Memory with N-1             - configured memory of running VMs vs. host memory minus
+                                       CVM, without the largest host
       6. CPU with N-1                - cluster CPU peak in the window projected onto N-1 hosts
                                        (main CPU criterion)
       7. CPU Ready                   - highest CPU Ready per VM in the window (warning only)
@@ -33,10 +34,10 @@
     from the official Nutanix v4 SDKs (ntnx-clustermgmt/vmm/monitoring/prism-py-client 4.3):
       clustermgmt  config/clusters (config.faultToleranceState, config.buildInfo),
                    config/clusters/{id}/hosts (maintenanceState, nodeStatus, hostType, gpuList),
+                   config/clusters/{id}/cvms (memorySizeBytes, nodeExtId),
                    stats/clusters/{id} and .../hosts/{id} (hypervisorCpuUsagePpm,
-                   storageCapacityBytes, storageUsageBytes, memoryCapacityBytes,
-                   totalMemoryAllottedToVmBytes, haMemoryReservedBytes, cpuOvercommitRatioPpm,
-                   memoryOvercommitRatioPpm),
+                   storageCapacityBytes, storageUsageBytes, memoryCapacityBytes; from v4.3
+                   also haMemoryReservedBytes),
                    config/clusters/{id}/$actions/compute-non-migratable-vms,
                    config/clusters/{id}/physical-gpu-profiles, virtual-gpu-profiles
       vmm          ahv/config/vms (isLiveMigrateCapable, isMemoryOvercommitEnabled, gpus,
@@ -48,12 +49,14 @@
     Approximations (see README):
     - Resilient capacity = storage capacity minus the capacity of the largest host(s)
       (one host for FT1, two for FT2). Prism's own value may differ slightly.
-    - Memory N-1 compares the memory allotted to running VMs with the capacity without the
-      largest host. CVM memory is included on both sides, so the result is conservative.
+    - Memory N-1 compares the configured memory of all running VMs (VM configuration, works
+      on every API revision) with the host memory minus the CVM memory, without the host
+      with the most available memory. VMs with memory overcommit count with their full size.
     - GPU N-1 assumes that the profile capacity (allocated + assignable) is spread evenly
       across all GPU cards in the cluster.
 
-    The API revision is negotiated per namespace: -ApiVersion first, then v4.2, v4.1, v4.0.
+    The API revision is negotiated per namespace: -ApiVersion first, then v4.3, v4.2, v4.1, v4.0.
+    Fields that only exist from v4.3 on (haMemoryReservedBytes) are used when available.
     Requires PowerShell 7+ (uses -SkipCertificateCheck / -SkipHeaderValidation).
 .PARAMETER PcIp
     IP address(es) or FQDN(s) of one or more Prism Central instances (without https:// or
@@ -92,7 +95,7 @@
 .PARAMETER CsvPath
     Optional CSV export (semicolon-delimited, UTF-8) of all check results.
 .PARAMETER ApiVersion
-    Preferred Nutanix v4 API revision. Default: "v4.2".
+    Preferred Nutanix v4 API revision. Default: "v4.3" (falls back to v4.2, v4.1, v4.0).
 .EXAMPLE
     .\Test-NtnxUpgradeReadiness.ps1 -PcIp 10.0.20.10 -Credential $creds -ClusterNames "NTNX-CL01" -ChangeId "CHG0012345"
 
@@ -110,7 +113,7 @@ param(
 
     [string[]]$ClusterNames,
     [string]$ChangeId,
-    [string]$Engineer = $(if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USER }),
+    [string]$Engineer = $(if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { [Environment]::UserName }),
 
     [ValidateRange(1, 8760)]
     [int]$Hours = 168,
@@ -128,7 +131,7 @@ param(
     [string]$ReportFolder = (Get-Location).Path,
     [string]$CsvPath,
 
-    [string]$ApiVersion = "v4.2"
+    [string]$ApiVersion = "v4.3"
 )
 
 $PSDefaultParameterValues = @{ 'Invoke-RestMethod:SkipCertificateCheck' = $true }
@@ -196,7 +199,7 @@ function Invoke-NtnxV4 {
     param([string]$Namespace, [string]$Method = 'GET', [string]$Path, $Body)
 
     $candidates = if ($script:nsVersion[$Namespace]) { @($script:nsVersion[$Namespace]) }
-                  else { @($ApiVersion, 'v4.2', 'v4.1', 'v4.0') | Select-Object -Unique }
+                  else { @($ApiVersion, 'v4.3', 'v4.2', 'v4.1', 'v4.0') | Select-Object -Unique }
     $lastError = $null
     foreach ($ver in $candidates) {
         try {
@@ -232,18 +235,20 @@ function Get-NtnxPagedV4 {
 
 function Get-NtnxStats {
     # Returns a hashtable metric -> array of {timestamp, value} for a clustermgmt stats path.
-    param([string]$Path, [string[]]$Fields, [string]$StatType, [string]$From, [string]$To, [int]$Interval)
+    # Fields the API revision does not know are simply missing from the result. -NoSelect
+    # skips $select (the API rejects the whole $select if a single field is unknown, which
+    # happens for fields added in later revisions).
+    param([string]$Path, [string[]]$Fields, [string]$StatType, [string]$From, [string]$To, [int]$Interval, [switch]$NoSelect)
 
     $query = "`$startTime=$([uri]::EscapeDataString($From))" +
              "&`$endTime=$([uri]::EscapeDataString($To))" +
              "&`$samplingInterval=$Interval&`$statType=$StatType"
     $result = $null
-    if ($script:useSelect) {
+    if (-not $NoSelect) {
         try {
             $result = Invoke-NtnxV4 -Namespace clustermgmt -Path "$($Path)?$query&`$select=$([uri]::EscapeDataString($Fields -join ','))"
         } catch {
             Write-Verbose "`$select rejected, retrying without it: $($_.Exception.Message)"
-            $script:useSelect = $false
         }
     }
     if (-not $result) { $result = Invoke-NtnxV4 -Namespace clustermgmt -Path "$($Path)?$query" }
@@ -287,6 +292,27 @@ function ConvertTo-LocalTime {
         return $Timestamp.ToLocalTime()
     }
     return ([datetimeoffset]::Parse([string]$Timestamp, [cultureinfo]::InvariantCulture)).LocalDateTime
+}
+
+function Get-ItemCount {
+    # Counts the non-null items of a property that may be $null, a single object or an
+    # array. Needed because @($null).Count is 1 in PowerShell.
+    param($Value)
+    @($Value | Where-Object { $null -ne $_ }).Count
+}
+
+function Expand-AlertText {
+    # Alert title and message contain placeholders like {vm_name}; the values are in the
+    # alert's parameters (paramName + paramValue.value).
+    param([string]$Text, $Parameters)
+    if (-not $Text) { return $Text }
+    foreach ($p in @($Parameters | Where-Object { $null -ne $_ })) {
+        if (-not $p.paramName) { continue }
+        $v = $p.paramValue
+        $val = if ($null -eq $v) { '' } elseif ($v.PSObject.Properties['value']) { [string]$v.value } else { [string]$v }
+        $Text = $Text.Replace("{$($p.paramName)}", $val)
+    }
+    return $Text
 }
 
 function ConvertTo-Percent { param($Ppm) if ($null -eq $Ppm) { $null } else { [math]::Round([double]$Ppm / 10000, 2) } }
@@ -407,19 +433,34 @@ foreach ($pc in $PcIp) {
             $cpuSeries = (Get-NtnxStats -Path "/stats/clusters/$($cl.extId)" -Fields @('hypervisorCpuUsagePpm') -StatType MAX -From $startIso -To $endIso -Interval 300)['hypervisorCpuUsagePpm']
             $nowFields = @('storageCapacityBytes', 'storageUsageBytes', 'memoryCapacityBytes', 'totalMemoryAllottedToVmBytes',
                            'haMemoryReservedBytes', 'cpuOvercommitRatioPpm', 'memoryOvercommitRatioPpm', 'aggregateVmConfiguredVcpus')
-            $s = Get-NtnxStats -Path "/stats/clusters/$($cl.extId)" -Fields $nowFields -StatType LAST -From $recentIso -To $endIso -Interval 300
+            # No $select: several of these fields only exist from API revision v4.3 on
+            $s = Get-NtnxStats -Path "/stats/clusters/$($cl.extId)" -Fields $nowFields -StatType LAST -From $recentIso -To $endIso -Interval 300 -NoSelect
             foreach ($f in $nowFields) { $now[$f] = Get-Latest $s[$f] }
         } catch {
             Write-Warning "Cluster stats for $($cl.name) failed: $($_.Exception.Message)"
         }
+
+        # --- CVMs (memory per host, subtracted from the capacity available to VMs) ---
+        $cvmMemByHost = @{}
+        $cvmNames     = @()
+        try {
+            foreach ($cvm in (Get-NtnxPagedV4 -Namespace clustermgmt -Path "/config/clusters/$($cl.extId)/cvms")) {
+                if ($cvm.nodeExtId) { $cvmMemByHost[$cvm.nodeExtId] = [double]$cvm.memorySizeBytes }
+                if ($cvm.name) { $cvmNames += $cvm.name }
+            }
+        } catch {
+            Write-Verbose "CVM list for $($cl.name) not available: $($_.Exception.Message)"
+        }
+        # Exclude CVMs in case the VM list contains them
+        $userVms = @($onVms | Where-Object { $cvmNames -notcontains $_.name -and $_.name -notmatch '^NTNX-.*-CVM$' })
 
         # --- Host stats ---
         $hostRows = foreach ($h in $hosts) {
             $hs = @{}
             $hPeak = $null
             try {
-                $f = @('memoryCapacityBytes', 'storageCapacityBytes', 'totalMemoryAllottedToVmBytes')
-                $r = Get-NtnxStats -Path "/stats/clusters/$($cl.extId)/hosts/$($h.extId)" -Fields $f -StatType LAST -From $recentIso -To $endIso -Interval 300
+                $f = @('memoryCapacityBytes', 'storageCapacityBytes')
+                $r = Get-NtnxStats -Path "/stats/clusters/$($cl.extId)/hosts/$($h.extId)" -Fields $f -StatType LAST -From $recentIso -To $endIso -Interval 300 -NoSelect
                 foreach ($x in $f) { $hs[$x] = Get-Latest $r[$x] }
                 $c = Get-NtnxStats -Path "/stats/clusters/$($cl.extId)/hosts/$($h.extId)" -Fields @('hypervisorCpuUsagePpm') -StatType MAX -From $startIso -To $endIso -Interval 300
                 $hPeak = Get-Peak $c['hypervisorCpuUsagePpm']
@@ -433,11 +474,13 @@ foreach ($pc in $PcIp) {
                 Maintenance      = $h.maintenanceState
                 RebootPending    = $h.isRebootPending
                 MemoryBytes      = if ($hs.memoryCapacityBytes) { $hs.memoryCapacityBytes } else { $h.memorySizeBytes }
+                CvmMemoryBytes   = $cvmMemByHost[$h.extId]
                 StorageBytes     = $hs.storageCapacityBytes
-                AllottedVmBytes  = $hs.totalMemoryAllottedToVmBytes
+                Cores            = $h.numberOfCpuCores
+                Threads          = $h.numberOfCpuThreads
                 MaxCpuPct        = if ($hPeak) { ConvertTo-Percent $hPeak.value } else { $null }
                 MaxCpuAt         = if ($hPeak) { ConvertTo-LocalTime $hPeak.timestamp } else { $null }
-                Gpus             = @($h.gpuList).Count
+                Gpus             = Get-ItemCount $h.gpuList
             }
         }
         $hostRows = @($hostRows)
@@ -488,27 +531,32 @@ foreach ($pc in $PcIp) {
                 Add-Check $checks 'HA reservation' WARN 'Not enabled' 'Enabled' 'No memory is reserved for a host failure (best effort). The memory check below shows whether the VMs still fit on N-1.'
             }
         } else {
-            Add-Check $checks 'HA reservation' SKIPPED 'n/a' 'Enabled' 'haMemoryReservedBytes not returned by the API.'
+            # haMemoryReservedBytes only exists from API revision v4.3 on. Not a finding: the
+            # memory check below is the actual criterion.
+            Add-Check $checks 'HA reservation' INFO 'Not available via API' 'Enabled' "The HA reservation state is only exposed from API v4.3 (this PC: clustermgmt $($script:nsVersion['clustermgmt'])). Check Prism Element > Settings > Manage VM High Availability. The memory check below verifies N-1 independently."
         }
 
         # ===== 5. Memory with N-1 =====
+        # Required: configured memory of all running user VMs (from the VM configuration, so it
+        # works on every API revision). Available: per host memory minus its CVM, without the
+        # host with the most available memory.
         $memHosts = @($hostRows | Where-Object { $_.Type -ne 'STORAGE_ONLY' -and $_.MemoryBytes })
-        $allotted = if ($null -ne $now.totalMemoryAllottedToVmBytes) { [double]$now.totalMemoryAllottedToVmBytes }
-                    else { ($memHosts | Measure-Object AllottedVmBytes -Sum).Sum }
-        if ($memHosts.Count -gt 1 -and $allotted) {
-            $capTotal = ($memHosts | Measure-Object MemoryBytes -Sum).Sum
-            $capN1    = $capTotal - ($memHosts | Measure-Object MemoryBytes -Maximum).Maximum
-            $pct      = [math]::Round($allotted / $capN1 * 100, 1)
+        $vmMem    = ($userVms | Measure-Object memorySizeBytes -Sum).Sum
+        if ($memHosts.Count -gt 1) {
+            $avail    = @($memHosts | ForEach-Object { [double]$_.MemoryBytes - [double]$(if ($_.CvmMemoryBytes) { $_.CvmMemoryBytes } else { 0 }) })
+            $capTotal = ($avail | Measure-Object -Sum).Sum
+            $capN1    = $capTotal - ($avail | Measure-Object -Maximum).Maximum
+            $pct      = [math]::Round([double]$vmMem / $capN1 * 100, 1)
             $res      = if ($pct -gt $MemoryThresholdPercent) { 'FAIL' } else { 'PASS' }
-            $oc       = @($onVms | Where-Object isMemoryOvercommitEnabled).Count
-            $detail   = "{0} allotted to running VMs, N-1 capacity {1} (total {2}). VMs with memory overcommit: {3}" -f (Format-GiB $allotted), (Format-GiB $capN1), (Format-GiB $capTotal), $oc
+            $oc       = @($userVms | Where-Object isMemoryOvercommitEnabled).Count
+            $cvmNote  = if ($cvmMemByHost.Count) { 'CVM memory subtracted' } else { 'CVM memory could not be read and is NOT subtracted' }
+            $detail   = "{0} configured on {1} running VM(s), N-1 capacity {2} (all hosts {3}, {4}). VMs with memory overcommit: {5} (counted with full size)" -f (Format-GiB $vmMem), $userVms.Count, (Format-GiB $capN1), (Format-GiB $capTotal), $cvmNote, $oc
             Add-Check $checks 'Memory with N-1' $res "$pct %" "<= $MemoryThresholdPercent %" $detail
-        } elseif ($memHosts.Count -le 1) {
-            Add-Check $checks 'Memory with N-1' FAIL 'Single host' 'At least 2 hosts' 'Single-node cluster - VMs must be shut down for the upgrade.'
         } else {
-            Add-Check $checks 'Memory with N-1' WARN 'n/a' "<= $MemoryThresholdPercent %" 'Memory values could not be determined.'
+            Add-Check $checks 'Memory with N-1' FAIL 'Single host' 'At least 2 hosts' 'Single-node cluster - VMs must be shut down for the upgrade.'
         }
-        if ($null -ne $now.memoryOvercommitRatioPpm) { $extra.Info['Memory overcommit ratio'] = '{0:N2} : 1' -f ($now.memoryOvercommitRatioPpm / 1e6) }
+        $hostMem = ($memHosts | Measure-Object MemoryBytes -Sum).Sum
+        if ($hostMem) { $extra.Info['Memory allocation (running VMs : hosts)'] = '{0:N2} : 1 ({1} of {2})' -f ([double]$vmMem / $hostMem), (Format-GiB $vmMem), (Format-GiB $hostMem) }
 
         # ===== 6. CPU with N-1 =====
         $n = $vmHosts.Count
@@ -523,7 +571,16 @@ foreach ($pc in $PcIp) {
         } else {
             Add-Check $checks 'CPU peak with N-1' WARN 'n/a' "<= $CpuThresholdPercent %" 'No CPU usage data in the window.'
         }
-        if ($null -ne $now.cpuOvercommitRatioPpm) { $extra.Info['vCPU : pCPU ratio (current)'] = '{0:N2} : 1' -f ($now.cpuOvercommitRatioPpm / 1e6) }
+        # vCPU ratio from the VM configuration (works on every API revision)
+        $vcpus = ($userVms | ForEach-Object { [int]$_.numSockets * [int]$_.numCoresPerSocket * [int]$(if ($_.numThreadsPerCore) { $_.numThreadsPerCore } else { 1 }) } | Measure-Object -Sum).Sum
+        $cores = ($vmHosts | ForEach-Object { [int]$_.numberOfCpuCores } | Measure-Object -Sum).Sum
+        if ($cores) {
+            $extra.Info['vCPU : physical core ratio (running VMs)'] = '{0:N2} : 1 ({1} vCPU on {2} cores)' -f ($vcpus / $cores), $vcpus, $cores
+            if ($n -gt 1) {
+                $coresN1 = $cores - ($vmHosts | ForEach-Object { [int]$_.numberOfCpuCores } | Measure-Object -Maximum).Maximum
+                if ($coresN1) { $extra.Info['vCPU : physical core ratio with N-1'] = '{0:N2} : 1' -f ($vcpus / $coresN1) }
+            }
+        }
         if ($null -ne $now.aggregateVmConfiguredVcpus) { $extra.Info['Configured vCPUs'] = $now.aggregateVmConfiguredVcpus }
 
         # ===== 7. CPU Ready =====
@@ -548,7 +605,7 @@ foreach ($pc in $PcIp) {
         }
 
         # ===== 8. GPU with N-1 =====
-        $gpuVms = @($onVms | Where-Object { @($_.gpus).Count -gt 0 })
+        $gpuVms = @($onVms | Where-Object { (Get-ItemCount $_.gpus) -gt 0 })
         if (-not $gpuVms) {
             Add-Check $checks 'GPU with N-1' PASS 'No GPU VMs' '-' 'No running VM uses a GPU.'
         } else {
@@ -557,8 +614,8 @@ foreach ($pc in $PcIp) {
                 $totCards  = ($cards | Measure-Object Gpus -Sum).Sum
                 $maxCards  = ($cards | Measure-Object Gpus -Maximum).Maximum
                 $profiles  = @()
-                $profiles += @(Get-NtnxPagedV4 -Namespace clustermgmt -Path "/config/clusters/$($cl.extId)/virtual-gpu-profiles"  | ForEach-Object { [pscustomobject]@{ Kind = 'vGPU';        Cfg = $_.virtualGpuConfig;  Alloc = @($_.allocatedVmExtIds).Count } })
-                $profiles += @(Get-NtnxPagedV4 -Namespace clustermgmt -Path "/config/clusters/$($cl.extId)/physical-gpu-profiles" | ForEach-Object { [pscustomobject]@{ Kind = 'Passthrough'; Cfg = $_.physicalGpuConfig; Alloc = @($_.allocatedVmExtIds).Count } })
+                $profiles += @(Get-NtnxPagedV4 -Namespace clustermgmt -Path "/config/clusters/$($cl.extId)/virtual-gpu-profiles"  | ForEach-Object { [pscustomobject]@{ Kind = 'vGPU';        Cfg = $_.virtualGpuConfig;  Alloc = Get-ItemCount $_.allocatedVmExtIds } })
+                $profiles += @(Get-NtnxPagedV4 -Namespace clustermgmt -Path "/config/clusters/$($cl.extId)/physical-gpu-profiles" | ForEach-Object { [pscustomobject]@{ Kind = 'Passthrough'; Cfg = $_.physicalGpuConfig; Alloc = Get-ItemCount $_.allocatedVmExtIds } })
                 $profiles  = @($profiles | Where-Object { $_.Alloc -gt 0 })
                 if (-not $totCards) { throw "no GPU cards reported on the hosts (gpuList)" }
                 $share   = $maxCards / $totCards
@@ -583,10 +640,11 @@ foreach ($pc in $PcIp) {
             $r    = Invoke-NtnxV4 -Namespace clustermgmt -Method POST -Path "/config/clusters/$($cl.extId)/`$actions/compute-non-migratable-vms" -Body $body
             $task = Wait-NtnxTask -TaskExtId $r.data.extId -TimeoutMinutes 5
             if ($task.status -ne 'SUCCEEDED') { throw "task status $($task.status)" }
-            # The result extId is not documented explicitly - try the affected entities and
-            # completion details of the task.
-            $candidates = @($task.entitiesAffected.extId) + @($task.completionDetails.value) |
-                          Where-Object { $_ -match '^[0-9a-f]{8}-[0-9a-f]{4}-' } | Select-Object -Unique
+            # The result extId is not documented explicitly. It is one of the task's affected
+            # entities (besides the cluster and the hosts) or in its completion details.
+            $known      = @($cl.extId) + @($hosts.extId)
+            $candidates = @($task.completionDetails.value) + @($task.entitiesAffected.extId) |
+                          Where-Object { $_ -match '^[0-9a-f]{8}-[0-9a-f]{4}-' -and $known -notcontains $_ } | Select-Object -Unique
             foreach ($id in $candidates) {
                 try {
                     $res = Invoke-NtnxV4 -Namespace clustermgmt -Path "/config/clusters/$($cl.extId)/non-migratable-vms-result/$id"
@@ -603,7 +661,7 @@ foreach ($pc in $PcIp) {
                 $reasons = @()
                 if ($vm.isLiveMigrateCapable -eq $false) { $reasons += 'not live-migrate capable' }
                 if (@($vm.gpus | Where-Object { $_.mode -like 'PASSTHROUGH*' }).Count) { $reasons += 'GPU passthrough' }
-                if (@($vm.pcieDevices).Count) { $reasons += 'PCIe device' }
+                if ((Get-ItemCount $vm.pcieDevices) -gt 0) { $reasons += 'PCIe device' }
                 $hName = ($hosts | Where-Object { $_.extId -eq $vm.host.extId } | Select-Object -First 1).hostName
                 if ($reasons) { [pscustomobject]@{ VM = $vm.name; Reason = $reasons -join ', '; Host = $(if ($hName) { $hName } else { $vm.host.extId }) } }
             })
@@ -652,12 +710,28 @@ foreach ($pc in $PcIp) {
                 ($_.clusterUUID -eq $cl.extId -or $_.originatingClusterUUID -eq $cl.extId) -and $_.severity -in @('CRITICAL', 'WARNING')
             } | Sort-Object @{ Expression = { if ($_.severity -eq 'CRITICAL') { 0 } else { 1 } } }, creationTime)
 
-            $open = @($alerts | Where-Object { -not $_.isAcknowledged })
-            $ack  = @($alerts | Where-Object isAcknowledged)
-            $extra.AckAlerts = @($ack | ForEach-Object { [pscustomobject]@{ Severity = $_.severity; Title = $_.title; Created = ConvertTo-LocalTime $_.creationTime; AcknowledgedBy = $_.acknowledgedByUsername } })
+            # Fill the {placeholders} in title and message from the alert parameters
+            $alerts = @($alerts | ForEach-Object {
+                [pscustomobject]@{
+                    Severity       = $_.severity
+                    Title          = Expand-AlertText $_.title $_.parameters
+                    Message        = Expand-AlertText $_.message $_.parameters
+                    Created        = ConvertTo-LocalTime $_.creationTime
+                    Acknowledged   = [bool]$_.isAcknowledged
+                    AcknowledgedBy = $_.acknowledgedByUsername
+                }
+            })
+            $open = @($alerts | Where-Object { -not $_.Acknowledged })
+            $ack  = @($alerts | Where-Object Acknowledged)
+            $extra.AckAlerts = $ack
 
-            foreach ($a in $open) {
-                Add-Check $checks "Alert: $($a.title)" WARN $a.severity 'No open Critical/Warning alerts' ("{0} (raised {1:yyyy-MM-dd HH:mm})" -f $a.message, (ConvertTo-LocalTime $a.creationTime))
+            # One finding (and one justification) per alert title and severity
+            foreach ($g in ($open | Group-Object Severity, Title)) {
+                $first = $g.Group[0]
+                $times = if ($g.Count -gt 1) { " ($($g.Count)x)" } else { '' }
+                $msgs  = @($g.Group | Sort-Object Created | ForEach-Object { "{0} (raised {1:yyyy-MM-dd HH:mm})" -f $_.Message, $_.Created } | Select-Object -Unique)
+                $more  = if ($msgs.Count -gt 5) { " ... and $($msgs.Count - 5) more" } else { '' }
+                Add-Check $checks "Alert: $($first.Title)$times" WARN $first.Severity 'No open Critical/Warning alerts' ((($msgs | Select-Object -First 5) -join ' | ') + $more)
             }
             if (-not $open) {
                 Add-Check $checks 'Open alerts' PASS '0 unacknowledged' 'No open Critical/Warning alerts' "$($ack.Count) acknowledged alert(s) listed for information."
@@ -675,9 +749,10 @@ foreach ($pc in $PcIp) {
                 Write-Host ""
                 Write-Host "  [$($w.Value)] $($w.Check)" -ForegroundColor Yellow
                 Write-Host "  $($w.Detail)" -ForegroundColor DarkGray
+                # Up to 3 attempts; [string] guards against $null when input is redirected/closed
                 $j = ''
-                while (-not $j.Trim()) { $j = Read-Host "  Justification" }
-                $w.Justification = $j.Trim()
+                for ($try = 0; $try -lt 3 -and -not $j; $try++) { $j = ([string](Read-Host "  Justification")).Trim() }
+                if ($j) { $w.Justification = $j }
             }
         }
         foreach ($w in $warns) { if (-not $w.Justification) { $w.Justification = '(no justification provided)' } }
