@@ -86,6 +86,10 @@
     Do not start the NCC health checks.
 .PARAMETER NccTimeoutMinutes
     Maximum time to wait for the NCC run per cluster. Default: 60.
+.PARAMETER NccReportRecipients
+    Email address(es) for the NCC run summary. The API requires a recipient: without this
+    parameter the alert email configuration of Prism Central is used; if none is configured,
+    NCC cannot be started (reported as warning).
 .PARAMETER SkipCpuReady
     Skip the CPU Ready evaluation (faster on large environments).
 .PARAMETER NonInteractive
@@ -125,6 +129,7 @@ param(
 
     [switch]$SkipNcc,
     [ValidateRange(1, 480)][int]$NccTimeoutMinutes = 60,
+    [string[]]$NccReportRecipients,
     [switch]$SkipCpuReady,
     [switch]$NonInteractive,
 
@@ -158,7 +163,9 @@ if (-not (Test-Path $ReportFolder)) { New-Item -ItemType Directory -Path $Report
 
 function Invoke-NtnxApi {
     # Same as in the other scripts, except that the original exception is kept as
-    # InnerException, so Invoke-NtnxV4 can read the HTTP status code for version fallback.
+    # InnerException, so Invoke-NtnxV4 can read the HTTP status code for version fallback,
+    # and that only the error message(s) of the v4 error response are put into the
+    # exception text (the full JSON goes to the verbose stream).
     param($Method, $Path, $Body)
 
     $headers = $authHeader.Clone()
@@ -176,8 +183,16 @@ function Invoke-NtnxApi {
         Invoke-RestMethod @params -ErrorAction Stop
     } catch {
         $errorDetail = $_.ErrorDetails.Message
-        $msg = if ($errorDetail) { "Nutanix API call failed ($Method $Path):`n$errorDetail" } else { "Nutanix API call failed ($Method $Path): $($_.Exception.Message)" }
-        throw [System.Exception]::new($msg, $_.Exception)
+        $text = $_.Exception.Message
+        if ($errorDetail) {
+            Write-Verbose "API error response ($Method $Path): $errorDetail"
+            try {
+                $j = $errorDetail | ConvertFrom-Json -ErrorAction Stop
+                $m = @($j.data.error | ForEach-Object { if ($_.code) { "[$($_.code)] $($_.message)" } else { $_.message } } | Where-Object { $_ })
+                $text = if ($m) { $m -join ' ' } else { $errorDetail }
+            } catch { $text = $errorDetail }
+        }
+        throw [System.Exception]::new("Nutanix API call failed ($Method $Path): $text", $_.Exception)
     }
 }
 
@@ -373,12 +388,22 @@ foreach ($pc in $PcIp) {
     if (-not $SkipNcc) {
         foreach ($cl in $clusters) {
             try {
-                $body = @{ shouldRunAllChecks = $true; shouldSendReportToConfiguredRecipients = $false; shouldAnonymize = $false }
+                # The API requires a recipient for the NCC run summary: either the alert email
+                # configuration of the PC or additional recipients in the request.
+                $body = @{ shouldRunAllChecks = $true; shouldAnonymize = $false }
+                if ($NccReportRecipients) {
+                    $body.shouldSendReportToConfiguredRecipients = $false
+                    $body.additionalRecipients = @($NccReportRecipients)
+                } else {
+                    $body.shouldSendReportToConfiguredRecipients = $true
+                }
                 $r = Invoke-NtnxV4 -Namespace monitoring -Method POST -Path "/serviceability/clusters/$($cl.extId)/`$actions/run-system-defined-checks" -Body $body
                 $nccTasks[$cl.extId] = @{ TaskId = $r.data.extId; Started = Get-Date; Error = $null }
                 Write-Host "  NCC started on $($cl.name)" -ForegroundColor DarkGray
             } catch {
-                $nccTasks[$cl.extId] = @{ TaskId = $null; Started = Get-Date; Error = $_.Exception.Message }
+                $err = $_.Exception.Message
+                if ($err -match 'NCC-40031') { $err = 'No recipient for the NCC run summary: no alert email is configured on Prism Central. Use -NccReportRecipients or configure the alert email on PC.' }
+                $nccTasks[$cl.extId] = @{ TaskId = $null; Started = Get-Date; Error = $err }
                 Write-Warning "NCC could not be started on $($cl.name): $($_.Exception.Message)"
             }
         }
@@ -668,16 +693,27 @@ foreach ($pc in $PcIp) {
             }
             if ($null -eq $nonMig) { throw "result not found in task details" }
         } catch {
-            Write-Verbose "compute-non-migratable-vms not usable on $($cl.name): $($_.Exception.Message) - using VM properties"
+            Write-Verbose "compute-non-migratable-vms not usable on $($cl.name): $($_.Exception.Message) - using VM properties only"
+            $nonMig = $null
+        }
+        # Cross-check with the VM properties of the running VMs (the AOS result was
+        # observed to come back empty on some runs)
+        $byProps = @(foreach ($vm in $onVms) {
+            $reasons = @()
+            if ($vm.isLiveMigrateCapable -eq $false) { $reasons += 'not live-migrate capable' }
+            if (@($vm.gpus | Where-Object { $_.mode -like 'PASSTHROUGH*' }).Count) { $reasons += 'GPU passthrough' }
+            if ((Get-ItemCount $vm.pcieDevices) -gt 0) { $reasons += 'PCIe device' }
+            $hName = ($hosts | Where-Object { $_.extId -eq $vm.host.extId } | Select-Object -First 1).hostName
+            if ($reasons) { [pscustomobject]@{ VM = $vm.name; Reason = $reasons -join ', '; Host = $(if ($hName) { $hName } else { $vm.host.extId }) } }
+        })
+        if ($null -eq $nonMig) {
             $nonMigSource = 'VM properties (isLiveMigrateCapable, GPU passthrough, PCIe devices) - affinity rules not covered'
-            $nonMig = @(foreach ($vm in $onVms) {
-                $reasons = @()
-                if ($vm.isLiveMigrateCapable -eq $false) { $reasons += 'not live-migrate capable' }
-                if (@($vm.gpus | Where-Object { $_.mode -like 'PASSTHROUGH*' }).Count) { $reasons += 'GPU passthrough' }
-                if ((Get-ItemCount $vm.pcieDevices) -gt 0) { $reasons += 'PCIe device' }
-                $hName = ($hosts | Where-Object { $_.extId -eq $vm.host.extId } | Select-Object -First 1).hostName
-                if ($reasons) { [pscustomobject]@{ VM = $vm.name; Reason = $reasons -join ', '; Host = $(if ($hName) { $hName } else { $vm.host.extId }) } }
-            })
+            $nonMig = $byProps
+        } else {
+            $nonMigSource = 'AOS compute-non-migratable-vms, cross-checked with VM properties'
+            $missing = @($byProps | Where-Object { @($nonMig.VM) -notcontains $_.VM })
+            foreach ($m in $missing) { $m.Reason = "$($m.Reason) - VM property only, not in AOS result" }
+            $nonMig = @($nonMig) + $missing
         }
         $extra.NonMigratable = $nonMig
         $agentVms = @($onVms | Where-Object isAgentVm).Count

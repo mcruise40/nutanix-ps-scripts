@@ -42,6 +42,7 @@ The report also contains the **vCPU : physical core ratio** (current and with N-
 | `-CpuReadyThresholdPercent` | CPU Ready threshold per VM (warning only). Default: `5` |
 | `-SkipNcc` | Do not start NCC |
 | `-NccTimeoutMinutes` | Max. wait for NCC per cluster. Default: `60` |
+| `-NccReportRecipients` | Email address(es) for the NCC run summary. Required by the API if no alert email is configured on Prism Central |
 | `-SkipCpuReady` | Skip CPU Ready (faster on large environments) |
 | `-NonInteractive` | No prompts; warnings are reported as "no justification provided" |
 | `-ReportFolder` | Folder for the HTML reports. Default: current directory |
@@ -66,7 +67,8 @@ Report file name: `UpgradeReadiness_<cluster>_<change>_<yyyyMMdd-HHmm>.html`. Pr
 - **API revision** is negotiated per namespace: `-ApiVersion`, then `v4.3`, `v4.2`, `v4.1`, `v4.0`; the first one that does not return 404 is cached. Stats fields added in v4.3 (`haMemoryReservedBytes`, `totalMemoryAllottedToVmBytes`, overcommit ratios) are not required - the API rejects a whole `$select` if one field is unknown, so the "current value" queries run without `$select`.
 - Alert titles and messages contain placeholders (`{vm_name}`, `{cluster_name}`, ...); they are filled from the alert parameters.
 - The script sends two `POST` requests per cluster: the NCC run and `compute-non-migratable-vms`. Neither changes the configuration. NCC findings are raised as alerts, so alerts are read **after** NCC has finished.
-- **Non-migratable VMs:** the AOS action also covers affinity rules. The result ID is not documented explicitly; the script reads it from the task's affected entities / completion details. If the action is not available, it falls back to VM properties (`isLiveMigrateCapable`, GPU passthrough, PCIe devices) - affinity rules are then **not** covered (stated in the report).
+- **NCC:** the API only starts a run if the summary has a recipient - either the alert email configuration of Prism Central (used by default) or `-NccReportRecipients`. Otherwise the error `NCC-40031` is reported as a warning.
+- **Non-migratable VMs:** the AOS action also covers affinity rules. Its result is cross-checked with the VM properties of the running VMs, because it was observed to come back empty on some runs. The result ID is not documented explicitly; the script reads it from the task's affected entities / completion details. If the action is not available, it falls back to VM properties (`isLiveMigrateCapable`, GPU passthrough, PCIe devices) - affinity rules are then **not** covered (stated in the report).
 - **Approximations:**
   - Resilient capacity = storage capacity minus the capacity of the largest host (FT1) or the two largest hosts (FT2). Prism's own value may differ slightly.
   - Memory N-1 uses the configured memory of the running VMs (VM configuration) vs. host memory minus CVM memory (`config/clusters/{id}/cvms`), without the host with the most available memory. VMs with memory overcommit count with their full size (conservative).
