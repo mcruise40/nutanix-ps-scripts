@@ -185,7 +185,8 @@ function Invoke-NtnxApi {
         $errorDetail = $_.ErrorDetails.Message
         $text = $_.Exception.Message
         if ($errorDetail) {
-            Write-Verbose "API error response ($Method $Path): $errorDetail"
+            # 404 is expected while negotiating the API revision - no need to dump it
+            if ((Get-NtnxResponseCode $_.Exception) -ne 404) { Write-Verbose "API error response ($Method $Path): $errorDetail" }
             try {
                 $j = $errorDetail | ConvertFrom-Json -ErrorAction Stop
                 $m = @($j.data.error | ForEach-Object { if ($_.code) { "[$($_.code)] $($_.message)" } else { $_.message } } | Where-Object { $_ })
@@ -740,7 +741,10 @@ foreach ($pc in $PcIp) {
                 $msgs = (@($t.errorMessages.message) + @($t.warnings.message) | Where-Object { $_ }) -join ' '
                 switch ($t.status) {
                     'SUCCEEDED' { Add-Check $checks 'NCC health checks' PASS 'Completed' 'Run before upgrade' ("Run {0:yyyy-MM-dd HH:mm} - {1:HH:mm}. Findings are raised as alerts and evaluated below. {2}" -f $nt.Started, $done, $msgs) }
-                    'FAILED'    { Add-Check $checks 'NCC health checks' WARN 'Failed' 'Run before upgrade' "NCC task failed: $msgs" }
+                    'FAILED'    {
+                        $hint = if ($msgs -match 'no email configured') { ' -> Run again with -NccReportRecipients <address> or configure the alert email on Prism Central.' } else { '' }
+                        Add-Check $checks 'NCC health checks' WARN 'Failed' 'Run before upgrade' "NCC task failed: $msgs$hint"
+                    }
                     default     { Add-Check $checks 'NCC health checks' WARN "$($t.status)" 'Run before upgrade' "NCC did not finish within $NccTimeoutMinutes min (task $($nt.TaskId))." }
                 }
             }
