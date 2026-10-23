@@ -298,18 +298,27 @@ function Get-ItemCount {
     # Counts the non-null items of a property that may be $null, a single object or an
     # array. Needed because @($null).Count is 1 in PowerShell.
     param($Value)
-    @($Value | Where-Object { $null -ne $_ }).Count
+    @($Value | Where-Object { $null -ne $_ -and -not ($_ -is [string] -and -not $_.Trim()) }).Count
 }
 
 function Expand-AlertText {
     # Alert title and message contain placeholders like {vm_name}; the values are in the
-    # alert's parameters (paramName + paramValue.value).
+    # alert's parameters: paramName + paramValue, which is a typed object
+    # (monitoring.v4.common.StringValue/IntValue/BoolValue/DoubleValue).
     param([string]$Text, $Parameters)
     if (-not $Text) { return $Text }
     foreach ($p in @($Parameters | Where-Object { $null -ne $_ })) {
         if (-not $p.paramName) { continue }
-        $v = $p.paramValue
-        $val = if ($null -eq $v) { '' } elseif ($v.PSObject.Properties['value']) { [string]$v.value } else { [string]$v }
+        $v   = $p.paramValue
+        $val = ''
+        if ($null -ne $v) {
+            if ($v -is [string] -or $v -is [ValueType]) { $val = [string]$v }
+            else {
+                foreach ($k in @('stringValue', 'intValue', 'doubleValue', 'boolValue', 'value')) {
+                    if ($v.PSObject.Properties[$k]) { $val = [string]$v.$k; break }
+                }
+            }
+        }
         $Text = $Text.Replace("{$($p.paramName)}", $val)
     }
     return $Text
@@ -481,6 +490,7 @@ foreach ($pc in $PcIp) {
                 MaxCpuPct        = if ($hPeak) { ConvertTo-Percent $hPeak.value } else { $null }
                 MaxCpuAt         = if ($hPeak) { ConvertTo-LocalTime $hPeak.timestamp } else { $null }
                 Gpus             = Get-ItemCount $h.gpuList
+                GpuNames         = (@($h.gpuList | Where-Object { $_ -and "$_".Trim() }) | Group-Object | ForEach-Object { if ($_.Count -gt 1) { "$($_.Count)x $($_.Name)" } else { $_.Name } }) -join ', '
             }
         }
         $hostRows = @($hostRows)
@@ -648,7 +658,10 @@ foreach ($pc in $PcIp) {
             foreach ($id in $candidates) {
                 try {
                     $res = Invoke-NtnxV4 -Namespace clustermgmt -Path "/config/clusters/$($cl.extId)/non-migratable-vms-result/$id"
-                    $nonMig = @($res.data.vms | ForEach-Object { [pscustomobject]@{ VM = $_.vmName; Reason = $_.nonMigratableVmReason; Host = $_.hostIp.ipv4.value } })
+                    Write-Verbose "non-migratable-vms-result ${id}: $($res.data | ConvertTo-Json -Depth 6 -Compress)"
+                    $nonMig = @($res.data.vms | Where-Object { $null -ne $_ -and $_.vmName } | ForEach-Object {
+                        [pscustomobject]@{ VM = $_.vmName; Reason = $_.nonMigratableVmReason; Host = $_.hostIp.ipv4.value }
+                    })
                     $nonMigSource = 'AOS compute-non-migratable-vms'
                     break
                 } catch { Write-Verbose "Result $id not readable: $($_.Exception.Message)" }
@@ -817,7 +830,7 @@ footer{margin-top:32px;color:#7b8794;font-size:12px}
         [void]$sb.Append("</table><h2>Hosts</h2><table><tr><th>Host</th><th>Type</th><th>Status</th><th>Memory</th><th>Storage</th><th>CPU peak</th><th>Peak at</th><th>GPUs</th></tr>")
         foreach ($h in $hostRows) {
             $st = if ($h.Maintenance) { "$($h.NodeStatus) / $($h.Maintenance)" } else { $h.NodeStatus }
-            [void]$sb.Append("<tr><td>$(HtmlEnc $h.Host)</td><td>$(HtmlEnc $h.Type)</td><td>$(HtmlEnc $st)</td><td>$(Format-GiB $h.MemoryBytes)</td><td>$(Format-Bytes $h.StorageBytes)</td><td>$(HtmlEnc $(if ($null -ne $h.MaxCpuPct) { "$($h.MaxCpuPct) %" } else { 'n/a' }))</td><td>$(HtmlEnc $(if ($h.MaxCpuAt) { $h.MaxCpuAt.ToString('yyyy-MM-dd HH:mm') }))</td><td>$($h.Gpus)</td></tr>")
+            [void]$sb.Append("<tr><td>$(HtmlEnc $h.Host)</td><td>$(HtmlEnc $h.Type)</td><td>$(HtmlEnc $st)</td><td>$(Format-GiB $h.MemoryBytes)</td><td>$(Format-Bytes $h.StorageBytes)</td><td>$(HtmlEnc $(if ($null -ne $h.MaxCpuPct) { "$($h.MaxCpuPct) %" } else { 'n/a' }))</td><td>$(HtmlEnc $(if ($h.MaxCpuAt) { $h.MaxCpuAt.ToString('yyyy-MM-dd HH:mm') }))</td><td>$(HtmlEnc $(if ($h.GpuNames) { $h.GpuNames } else { '-' }))</td></tr>")
         }
         [void]$sb.Append("</table>")
         if ($extra.NonMigratable) {
