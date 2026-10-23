@@ -281,6 +281,35 @@ function Get-NtnxStats {
     return $out
 }
 
+function Get-NtnxClusterEvents {
+    # Events of one cluster in a time window (monitoring/serviceability/events). Tries an
+    # OData filter on creationTime first; if rejected, pages newest-first and stops at the
+    # start of the window (max. 10 pages).
+    param([string]$ClusterExtId, [datetime]$From, [datetime]$To)
+
+    $fromIso = $From.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $raw = $null
+    try {
+        $raw = @(Get-NtnxPagedV4 -Namespace monitoring -Path "/serviceability/events" -Query "`$filter=$([uri]::EscapeDataString("creationTime ge $fromIso"))")
+    } catch {
+        Write-Verbose "Event filter rejected, paging newest-first: $($_.Exception.Message)"
+        $raw = [System.Collections.Generic.List[object]]::new()
+        for ($page = 0; $page -lt 10; $page++) {
+            $r = Invoke-NtnxV4 -Namespace monitoring -Path "/serviceability/events?`$orderby=$([uri]::EscapeDataString('creationTime desc'))&`$page=$page&`$limit=100"
+            $items = @($r.data | Where-Object { $null -ne $_ })
+            foreach ($i in $items) { $raw.Add($i) }
+            $oldest = ($items | ForEach-Object { ConvertTo-LocalTime $_.creationTime } | Measure-Object -Minimum).Minimum
+            if ($items.Count -lt 100 -or ($oldest -and $oldest -lt $From)) { break }
+        }
+    }
+    @($raw | Where-Object { $_.clusterUUID -eq $ClusterExtId -or $_.sourceClusterUUID -eq $ClusterExtId } | ForEach-Object {
+        $time = ConvertTo-LocalTime $_.creationTime
+        if ($time -and $time -ge $From -and $time -le $To) {
+            [pscustomobject]@{ Time = $time; Type = $_.eventType; Service = $_.serviceName; Message = Expand-AlertText $_.message $_.parameters }
+        }
+    } | Sort-Object Time)
+}
+
 function Get-Latest { param($Series) ($Series | Sort-Object { ConvertTo-LocalTime $_.timestamp } | Select-Object -Last 1).value }
 function Get-Peak   { param($Series) $Series | Sort-Object value -Descending | Select-Object -First 1 }
 
@@ -479,7 +508,7 @@ foreach ($pc in $PcIp) {
 
         Write-Host "Checking cluster $($cl.name)" -ForegroundColor Cyan
         $checks  = [System.Collections.Generic.List[object]]::new()
-        $extra   = @{ Alerts = @(); AckAlerts = @(); NonMigratable = @(); CpuReady = @(); Hosts = @(); Info = [ordered]@{} }
+        $extra   = @{ Alerts = @(); AckAlerts = @(); NonMigratable = @(); CpuReady = @(); Hosts = @(); Info = [ordered]@{}; Ncc = $null }
         $clVms   = @($allVms | Where-Object { $_.cluster.extId -eq $cl.extId })
         $onVms   = @($clVms | Where-Object { $_.powerState -eq 'ON' })
         $ft      = $cl.config.faultToleranceState
@@ -773,8 +802,33 @@ foreach ($pc in $PcIp) {
                 $remaining = [math]::Max(1, [int]($NccTimeoutMinutes - ((Get-Date) - $nt.Started).TotalMinutes))
                 $t = Wait-NtnxTask -TaskExtId $nt.TaskId -TimeoutMinutes $remaining -Activity "NCC on $($cl.name)"
                 Write-Progress -Activity "NCC on $($cl.name)" -Completed
+                Write-Verbose "NCC task: $($t | ConvertTo-Json -Depth 8 -Compress)"
                 $done = ConvertTo-LocalTime $t.completedTime
                 $msgs = (@($t.errorMessages.message) + @($t.warnings.message) | Where-Object { $_ }) -join ' '
+
+                # The v4 API has no model for NCC check results (the per-check summary is
+                # only sent by email). The report shows what the task itself returns, the
+                # events of the cluster during the run and the alerts raised by it.
+                $details = @()
+                $details += @($t.completionDetails | Where-Object { $_.name } | ForEach-Object { "$($_.name): $($_.value)" })
+                $details += @($t.subSteps | Where-Object { $_.name } | ForEach-Object { "Step: $($_.name)" })
+                $details += @($t.warnings | Where-Object { $_.message } | ForEach-Object { "Warning: $($_.message)" })
+                $details += @($t.errorMessages | Where-Object { $_.message } | ForEach-Object { "Error: $($_.message)" })
+                $nccEnd = if ($done) { $done } else { Get-Date }
+                $events = @()
+                try { $events = @(Get-NtnxClusterEvents -ClusterExtId $cl.extId -From $nt.Started.AddMinutes(-1) -To $nccEnd.AddMinutes(1)) }
+                catch { Write-Verbose "Events for $($cl.name) not readable: $($_.Exception.Message)" }
+                $extra.Ncc = [ordered]@{
+                    Status     = $t.status
+                    Started    = $nt.Started
+                    Completed  = $done
+                    Duration   = if ($done) { '{0:N0} min' -f ($done - $nt.Started).TotalMinutes } else { '-' }
+                    Recipients = if ($script:nccRecipients) { $script:nccRecipients -join ', ' } else { 'Alert email configuration of Prism Central' }
+                    TaskId     = $nt.TaskId
+                    Details    = $details
+                    Events     = $events
+                    NewAlerts  = @()
+                }
                 switch ($t.status) {
                     'SUCCEEDED' { Add-Check $checks 'NCC health checks' PASS 'Completed' 'Run before upgrade' ("Run {0:yyyy-MM-dd HH:mm} - {1:HH:mm}. Findings are raised as alerts and evaluated below. {2}" -f $nt.Started, $done, $msgs) }
                     'FAILED'    {
@@ -810,6 +864,12 @@ foreach ($pc in $PcIp) {
                     AcknowledgedBy = $_.acknowledgedByUsername
                 }
             })
+            # Alerts raised while NCC was running (NCC findings)
+            if ($extra.Ncc) {
+                $from = $extra.Ncc.Started.AddMinutes(-1)
+                foreach ($a in $alerts) { if ($a.Created -and $a.Created -ge $from) { $a.Message = "$($a.Message) [raised during NCC run]" } }
+                $extra.Ncc.NewAlerts = @($alerts | Where-Object { $_.Created -and $_.Created -ge $from })
+            }
             $open = @($alerts | Where-Object { -not $_.Acknowledged })
             $ack  = @($alerts | Where-Object Acknowledged)
             $extra.AckAlerts = $ack
@@ -903,7 +963,31 @@ footer{margin-top:32px;color:#7b8794;font-size:12px}
             $j = if ($c.Justification) { "<div class='just'>Justification: $(HtmlEnc $c.Justification)</div>" } else { '' }
             [void]$sb.Append("<tr><td>$(HtmlEnc $c.Check)</td><td><span class='b $($badge[$c.Result])'>$($c.Result)</span></td><td>$(HtmlEnc $c.Value)</td><td>$(HtmlEnc $c.Threshold)</td><td>$(HtmlEnc $c.Detail)$j</td></tr>")
         }
-        [void]$sb.Append("</table><h2>Hosts</h2><table><tr><th>Host</th><th>Type</th><th>Status</th><th>Memory</th><th>Storage</th><th>CPU peak</th><th>Peak at</th><th>GPUs</th></tr>")
+        [void]$sb.Append("</table>")
+        if ($extra.Ncc) {
+            $n2 = $extra.Ncc
+            $nccClass = if ($n2.Status -eq 'SUCCEEDED') { 'pass' } else { 'warn' }
+            [void]$sb.Append("<h2>NCC run</h2><table class='kv'>")
+            [void]$sb.Append("<tr><td>Status</td><td><span class='b $nccClass'>$(HtmlEnc $n2.Status)</span></td></tr>")
+            [void]$sb.Append("<tr><td>Started / completed</td><td>$(HtmlEnc ('{0:yyyy-MM-dd HH:mm:ss} / {1}' -f $n2.Started, $(if ($n2.Completed) { $n2.Completed.ToString('yyyy-MM-dd HH:mm:ss') } else { '-' }))) ($(HtmlEnc $n2.Duration))</td></tr>")
+            [void]$sb.Append("<tr><td>Summary sent to</td><td>$(HtmlEnc $n2.Recipients)</td></tr>")
+            [void]$sb.Append("<tr><td>Task</td><td>$(HtmlEnc $n2.TaskId)</td></tr>")
+            foreach ($d in $n2.Details) { [void]$sb.Append("<tr><td>Task detail</td><td>$(HtmlEnc $d)</td></tr>") }
+            $newCount = @($n2.NewAlerts).Count
+            [void]$sb.Append("<tr><td>Alerts raised during the run</td><td>$newCount (Critical/Warning, included in the checks above)</td></tr>")
+            [void]$sb.Append("<tr><td>Note</td><td>The per-check NCC results are not exposed by the v4 API; they are in the NCC summary sent to the recipients above. Failed checks with alerting enabled appear as alerts.</td></tr></table>")
+            if ($n2.NewAlerts) {
+                [void]$sb.Append("<h3 style='font-size:14px;margin:16px 0 6px'>Alerts raised during the NCC run</h3><table><tr><th>Severity</th><th>Title</th><th>Raised</th></tr>")
+                foreach ($a in $n2.NewAlerts) { [void]$sb.Append("<tr><td>$(HtmlEnc $a.Severity)</td><td>$(HtmlEnc $a.Title)</td><td>$(HtmlEnc $a.Created.ToString('yyyy-MM-dd HH:mm'))</td></tr>") }
+                [void]$sb.Append("</table>")
+            }
+            if ($n2.Events) {
+                [void]$sb.Append("<h3 style='font-size:14px;margin:16px 0 6px'>Cluster events during the NCC run</h3><table><tr><th>Time</th><th>Type</th><th>Message</th></tr>")
+                foreach ($e in $n2.Events) { [void]$sb.Append("<tr><td>$(HtmlEnc $e.Time.ToString('HH:mm:ss'))</td><td>$(HtmlEnc $e.Type)</td><td>$(HtmlEnc $e.Message)</td></tr>") }
+                [void]$sb.Append("</table>")
+            }
+        }
+        [void]$sb.Append("<h2>Hosts</h2><table><tr><th>Host</th><th>Type</th><th>Status</th><th>Memory</th><th>Storage</th><th>CPU peak</th><th>Peak at</th><th>GPUs</th></tr>")
         foreach ($h in $hostRows) {
             $st = if ($h.Maintenance) { "$($h.NodeStatus) / $($h.Maintenance)" } else { $h.NodeStatus }
             [void]$sb.Append("<tr><td>$(HtmlEnc $h.Host)</td><td>$(HtmlEnc $h.Type)</td><td>$(HtmlEnc $st)</td><td>$(Format-GiB $h.MemoryBytes)</td><td>$(Format-Bytes $h.StorageBytes)</td><td>$(HtmlEnc $(if ($null -ne $h.MaxCpuPct) { "$($h.MaxCpuPct) %" } else { 'n/a' }))</td><td>$(HtmlEnc $(if ($h.MaxCpuAt) { $h.MaxCpuAt.ToString('yyyy-MM-dd HH:mm') }))</td><td>$(HtmlEnc $(if ($h.GpuNames) { $h.GpuNames } else { '-' }))</td></tr>")
