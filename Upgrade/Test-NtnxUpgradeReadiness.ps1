@@ -363,6 +363,8 @@ function Add-Check {
 # ---------------------------------------------------------------------------------------
 
 $allRows = [System.Collections.Generic.List[object]]::new()
+$script:nccRecipients = @($NccReportRecipients | Where-Object { $_ })
+$script:nccAsked      = $false
 
 foreach ($pc in $PcIp) {
 
@@ -385,28 +387,62 @@ foreach ($pc in $PcIp) {
     if (-not $clusters) { Write-Warning "No matching clusters on $pc."; continue }
 
     # --- Start NCC on all target clusters first (runs in parallel while we collect data) ---
+    # The API requires a recipient for the NCC run summary: either the alert email
+    # configuration of the PC (used when no -NccReportRecipients is given) or additional
+    # recipients in the request. Without an alert email on the PC the request is either
+    # rejected (NCC-40031) or accepted and the task fails a few seconds later. In both
+    # cases the engineer is asked for an address once (interactive runs only).
     $nccTasks = @{}
     if (-not $SkipNcc) {
         foreach ($cl in $clusters) {
-            try {
-                # The API requires a recipient for the NCC run summary: either the alert email
-                # configuration of the PC or additional recipients in the request.
-                $body = @{ shouldRunAllChecks = $true; shouldAnonymize = $false }
-                if ($NccReportRecipients) {
-                    $body.shouldSendReportToConfiguredRecipients = $false
-                    $body.additionalRecipients = @($NccReportRecipients)
-                } else {
-                    $body.shouldSendReportToConfiguredRecipients = $true
+            $result = $null
+            for ($attempt = 1; $attempt -le 2 -and -not $result; $attempt++) {
+                $missingRecipient = $false
+                try {
+                    $body = @{ shouldRunAllChecks = $true; shouldAnonymize = $false }
+                    if ($script:nccRecipients) {
+                        $body.shouldSendReportToConfiguredRecipients = $false
+                        $body.additionalRecipients = @($script:nccRecipients)
+                    } else {
+                        $body.shouldSendReportToConfiguredRecipients = $true
+                    }
+                    $r = Invoke-NtnxV4 -Namespace monitoring -Method POST -Path "/serviceability/clusters/$($cl.extId)/`$actions/run-system-defined-checks" -Body $body
+                    $taskId = $r.data.extId
+                    if (-not $script:nccRecipients) {
+                        # Detect the asynchronous "no email configured" failure early
+                        Start-Sleep -Seconds 5
+                        $t = (Invoke-NtnxV4 -Namespace prism -Path "/config/tasks/$taskId").data
+                        $msg = (@($t.errorMessages.message) | Where-Object { $_ }) -join ' '
+                        if ($t.status -eq 'FAILED' -and $msg -match 'no email configured') { $missingRecipient = $true }
+                    }
+                    if (-not $missingRecipient) {
+                        $result = @{ TaskId = $taskId; Started = Get-Date; Error = $null }
+                        Write-Host "  NCC started on $($cl.name)" -ForegroundColor DarkGray
+                    }
+                } catch {
+                    if ($_.Exception.Message -match 'NCC-40031|no email configured') { $missingRecipient = $true }
+                    else {
+                        $result = @{ TaskId = $null; Started = Get-Date; Error = $_.Exception.Message }
+                        Write-Warning "NCC could not be started on $($cl.name): $($_.Exception.Message)"
+                    }
                 }
-                $r = Invoke-NtnxV4 -Namespace monitoring -Method POST -Path "/serviceability/clusters/$($cl.extId)/`$actions/run-system-defined-checks" -Body $body
-                $nccTasks[$cl.extId] = @{ TaskId = $r.data.extId; Started = Get-Date; Error = $null }
-                Write-Host "  NCC started on $($cl.name)" -ForegroundColor DarkGray
-            } catch {
-                $err = $_.Exception.Message
-                if ($err -match 'NCC-40031') { $err = 'No recipient for the NCC run summary: no alert email is configured on Prism Central. Use -NccReportRecipients or configure the alert email on PC.' }
-                $nccTasks[$cl.extId] = @{ TaskId = $null; Started = Get-Date; Error = $err }
-                Write-Warning "NCC could not be started on $($cl.name): $($_.Exception.Message)"
+                if ($missingRecipient) {
+                    $addr = $null
+                    if (-not $NonInteractive -and -not $script:nccAsked) {
+                        $script:nccAsked = $true
+                        Write-Host "  No alert email is configured on Prism Central - NCC needs a recipient for its run summary." -ForegroundColor Yellow
+                        $addr = ([string](Read-Host "  Email address for the NCC summary (Enter = skip NCC)")).Trim()
+                    }
+                    if ($addr) {
+                        $script:nccRecipients = @($addr -split '[,; ]+' | Where-Object { $_ })
+                    } else {
+                        $result = @{ TaskId = $null; Started = Get-Date; Error = 'No recipient for the NCC run summary: no alert email is configured on Prism Central. Use -NccReportRecipients or configure the alert email on PC.' }
+                        Write-Warning "NCC not started on $($cl.name): no recipient for the run summary."
+                    }
+                }
             }
+            if (-not $result) { $result = @{ TaskId = $null; Started = Get-Date; Error = 'NCC could not be started (no valid recipient for the run summary).' } }
+            $nccTasks[$cl.extId] = $result
         }
     }
 
