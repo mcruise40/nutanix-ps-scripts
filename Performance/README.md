@@ -44,7 +44,7 @@ $creds = Get-Credential
 | `AvgReadyPct` / `MaxReadyPct` | Average and highest CPU Ready (%) in the window |
 | `AboveThreshold` | Number of samples above `-ThresholdPercent` |
 | `AvgCpuUsagePct` | Average hypervisor CPU usage (%) - CPU Ready should always be read together with usage |
-| `MaxReadyAt` | Timestamp (UTC) of the highest sample |
+| `MaxReadyAt` | Timestamp (local time) of the highest sample |
 
 Results are sorted by `MaxReadyPct` descending. The summary objects have more than 4 properties, so PowerShell shows them as a list by default - pipe to `Format-Table` for a table view.
 
@@ -52,7 +52,7 @@ Results are sorted by `MaxReadyPct` descending. The summary objects have more th
 - Endpoint: `GET /vmm/<ApiVersion>/ahv/stats/vms/{extId}` with `$startTime`, `$endTime`, `$samplingInterval`, `$statType` - one call per VM. Field names (`hypervisorCpuReadyTimePpm`, `hypervisorCpuUsagePpm`) are taken from the official Nutanix VMM SDK (`ntnx-vmm-py-client`, model `vmm.v4.ahv.stats.VmStatsTuple`).
 - **Unit:** the API returns ppm (parts per million). `10'000 ppm = 1 %` - the script converts to percent.
 - The script first requests only the needed fields via `$select`. If the PC rejects that expression, it automatically falls back to the full response for all further calls (only slower, same result).
-- Time window is sent in UTC (`...Z`) to avoid URL-encoding issues with `+` offsets.
+- Time window is sent in UTC (`...Z`) to avoid URL-encoding issues with `+` offsets. Returned timestamps (UTC) are converted to local time for output.
 - Cluster names are resolved via `/clustermgmt/<ApiVersion>/config/clusters`, falling back to `v4.0` if that revision is not available there. If both fail, the cluster extId is shown instead (and `-ClusterNames` cannot be used).
 - With `-StatType AVG` short spikes are smoothed over the sampling interval. For peaks use a smaller `-SamplingInterval` and/or `-StatType MAX`.
 - Whether Nutanix normalizes the value per vCPU (unlike VMware's per-VM summation in vCenter) is not explicitly documented - keep this in mind when comparing with vCenter values.

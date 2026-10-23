@@ -247,6 +247,21 @@ function Get-NtnxVmStatsSamples {
     return @($result.data.stats)
 }
 
+function ConvertTo-LocalTime {
+    # API timestamps are UTC (ISO-8601). PowerShell's JSON parser turns them into
+    # DateTime objects of kind Utc, which display without a zone marker - convert to
+    # local time so they match the evaluation window and the Prism UI.
+    param($Timestamp)
+    if ($null -eq $Timestamp) { return $null }
+    if ($Timestamp -is [datetime]) {
+        if ($Timestamp.Kind -eq [DateTimeKind]::Unspecified) {
+            $Timestamp = [datetime]::SpecifyKind($Timestamp, [DateTimeKind]::Utc)
+        }
+        return $Timestamp.ToLocalTime()
+    }
+    return ([datetimeoffset]::Parse([string]$Timestamp, [cultureinfo]::InvariantCulture)).LocalDateTime
+}
+
 function ConvertTo-Percent {
     # ppm -> percent (10'000 ppm = 1 %), $null stays $null
     param($Ppm)
@@ -355,7 +370,7 @@ foreach ($pc in $PcIp) {
                     Cluster       = $clusterName
                     VM            = $vm.name
                     vCPUs         = $vCpus
-                    Timestamp     = $s.timestamp
+                    Timestamp     = ConvertTo-LocalTime $s.timestamp
                     CpuReadyPct   = ConvertTo-Percent $s.hypervisorCpuReadyTimePpm
                     CpuUsagePct   = ConvertTo-Percent $s.hypervisorCpuUsagePpm
                 })
@@ -398,7 +413,7 @@ foreach ($pc in $PcIp) {
             MaxReadyPct    = ConvertTo-Percent $readyStats.Maximum
             AboveThreshold = $aboveCount
             AvgCpuUsagePct = ConvertTo-Percent $usageAvg
-            MaxReadyAt     = $peak.timestamp
+            MaxReadyAt     = ConvertTo-LocalTime $peak.timestamp
         })
     }
 
