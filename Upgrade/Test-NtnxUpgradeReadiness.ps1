@@ -1051,7 +1051,7 @@ footer{margin-top:32px;color:#7b8794;font-size:12px}
                 [void]$sb.Append("<h3 style='font-size:14px;margin:16px 0 6px'>Checks not passed</h3><table><tr><th>Result</th><th>Check ID</th><th>Check</th><th>KB</th></tr>")
                 foreach ($c2 in $n2.Checks) {
                     $cls = switch ($c2.Category) { 'FAIL' { 'fail' } 'ERROR' { 'fail' } 'WARN' { 'warn' } 'INFO' { 'info' } default { 'skip' } }
-                    [void]$sb.Append("<tr><td><span class='b $cls'>$(HtmlEnc $c2.Category)</span></td><td>$(HtmlEnc $c2.CheckId)</td><td>$(HtmlEnc $(if ($c2.Title) { $c2.Title } else { '(name not available via API)' }))</td><td>$(HtmlEnc $c2.Kb)</td></tr>")
+                    [void]$sb.Append("<tr><td><span class='b $cls'>$(HtmlEnc $c2.Category)</span></td><td>$(HtmlEnc $c2.CheckId)</td><td>$(HtmlEnc $(if ($c2.Title) { $c2.Title } else { '(name not available via API)' }))</td><td>$((@("$($c2.Kb)" -split ',\s*' | Where-Object { $_ }) | ForEach-Object { if ($_ -match '^https?://') { "<a href='$(HtmlEnc $_)'>$(HtmlEnc ($_ -replace '^https?://(www\.)?', ''))</a>" } else { HtmlEnc $_ } }) -join ', ')</td></tr>")
                 }
                 [void]$sb.Append("</table>")
             }
