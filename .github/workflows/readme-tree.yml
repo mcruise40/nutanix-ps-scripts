@@ -1,21 +1,36 @@
-on: [push]
+name: readme-tree
+
+# Regenerates the repository tree between the readme-tree markers in README.md
+# and commits it back to main.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The default GITHUB_TOKEN of newer repositories is read-only; pushing the
+# updated README needs write access to the repository contents.
+permissions:
+  contents: write
 
 jobs:
   tree:
     runs-on: ubuntu-latest
     name: readme-tree
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
       - name: Tree
-        uses: RavelloH/readme-tree@latest
-      - name: commit
-        continue-on-error: True
+        # Pinned to a commit instead of @latest: third-party code running with write access
+        uses: RavelloH/readme-tree@4e2cbe1007c909971623f09b4addcade745a8dbc
+
+      - name: Commit README
         run: |
-          git init
-          git pull
-          git config --local user.email "actions@github.com"
-          git config --local user.name "github-actions"
-          git add .
-          git commit -m "[Readme-Tree]`date '+%Y-%m-%d %H:%M:%S'`" || exit
-          git status
-          git push -f
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if git diff --cached --quiet; then
+            echo "README tree unchanged"
+            exit 0
+          fi
+          git commit -m "[Readme-Tree] update repository tree"
+          git push
