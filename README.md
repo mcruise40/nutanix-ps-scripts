@@ -8,30 +8,31 @@ A collection of PowerShell scripts for operating and managing Nutanix environmen
 ```
 .
 ├── .github
-│   └── workflows
-│       └── readme-tree.yml
+│   └── workflows
+│       └── readme-tree.yml
 ├── .gitignore
 ├── Move
-│   ├── Get-WindowsNutanixVirtIO.ps1
-│   ├── NutanixMove_MultiServerDeployment.ps1
-│   ├── NutanixMove_VMPrep.ps1
-│   └── README.md
+│   ├── Get-WindowsNutanixVirtIO.ps1
+│   ├── NutanixMove_MultiServerDeployment.ps1
+│   ├── NutanixMove_VMPrep.ps1
+│   └── README.md
 ├── Performance
-│   ├── Get-NtnxClusterCpuPeak.ps1
-│   ├── Get-NtnxVmCpuReady.ps1
-│   └── README.md
+│   ├── Get-NtnxClusterCpuPeak.ps1
+│   ├── Get-NtnxVmCpuReady.ps1
+│   └── README.md
 ├── README.md
 ├── RecoveryPoints
-│   ├── Get-NtnxRecoveryPoints.ps1
-│   ├── Invoke-NtnxRecoveryPointCleanup.ps1
-│   ├── New-NtnxGroupRecoveryPoint.ps1
-│   ├── README.md
-│   └── Remove-NtnxRecoveryPoint.ps1
-└── Upgrade
-    ├── README.md
-    └── Test-NtnxUpgradeReadiness.ps1
+│   ├── Get-NtnxRecoveryPoints.ps1
+│   ├── Invoke-NtnxRecoveryPointCleanup.ps1
+│   ├── New-NtnxGroupRecoveryPoint.ps1
+│   ├── README.md
+│   └── Remove-NtnxRecoveryPoint.ps1
+├── Upgrade
+│   ├── README.md
+│   └── Test-NtnxUpgradeReadiness.ps1
+└── tree.bak
 
-6 directories, 17 files
+7 directories, 18 files
 ```
 <!-- readme-tree end -->
 
