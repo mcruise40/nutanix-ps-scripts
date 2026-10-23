@@ -178,7 +178,7 @@ function Invoke-NtnxApi {
     }
 }
 
-function Get-HttpStatus {
+function Get-NtnxResponseCode {
     param($Exception)
     $e = $Exception
     while ($e) {
@@ -205,7 +205,7 @@ function Invoke-NtnxV4 {
             return $r
         } catch {
             $lastError = $_
-            $code = Get-HttpStatus $_.Exception
+            $code = Get-NtnxResponseCode $_.Exception
             if ($code -notin @(404, 501)) { throw }
             Write-Verbose "$Namespace/$ver$Path -> HTTP $code, trying next revision"
         }
