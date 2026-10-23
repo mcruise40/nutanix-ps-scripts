@@ -13,7 +13,7 @@ Pre-upgrade readiness check. Verifies per cluster that **one host can be taken o
 | 1 | Cluster and host state | Upgrade running/scheduled, host already in maintenance or not `NORMAL` | - |
 | 2 | Data resiliency | Current FT below desired FT | FT state not returned |
 | 3 | Storage | Usage above `-StorageThresholdPercent` of the resilient capacity | Capacity not determinable |
-| 4 | HA reservation | - | Not enabled (best effort). Only exposed from API v4.3 on - on older revisions shown as `INFO` |
+| 4 | HA reservation | - | Not enabled (best effort). Only exposed from API v4.3 on - on older revisions the engineer checks the UI (Prism Element > Settings > Manage VM High Availability) and confirms it in the script: Yes -> `PASS` (confirmed manually, with engineer and time), No -> `WARN`, skipped or `-NonInteractive` -> `WARN` (not confirmed) |
 | 5 | Memory with N-1 | Configured memory of running VMs above `-MemoryThresholdPercent` of the host memory minus CVMs, without the largest host | - |
 | 6 | CPU peak with N-1 | Projected cluster peak above `-CpuThresholdPercent` | No data |
 | 7 | CPU Ready | - | VMs above `-CpuReadyThresholdPercent` |

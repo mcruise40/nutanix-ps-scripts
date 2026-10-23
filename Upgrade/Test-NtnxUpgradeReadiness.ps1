@@ -9,8 +9,9 @@
       1. Cluster and host state      - no upgrade running, no host already in maintenance
       2. Data resiliency             - current fault tolerance >= configured fault tolerance
       3. Storage                     - usage in percent of the resilient capacity
-      4. HA reservation              - memory reserved for a host failure (Guarantee mode,
-                                       only exposed from API v4.3 on; INFO otherwise)
+      4. HA reservation              - memory reserved for a host failure (Guarantee mode).
+                                       Only exposed from API v4.3 on; otherwise the engineer
+                                       checks the UI and confirms it in the script
       5. Memory with N-1             - configured memory of running VMs vs. host memory minus
                                        CVM, without the largest host
       6. CPU with N-1                - cluster CPU peak in the window projected onto N-1 hosts
@@ -655,9 +656,26 @@ foreach ($pc in $PcIp) {
                 Add-Check $checks 'HA reservation' WARN 'Not enabled' 'Enabled' 'No memory is reserved for a host failure (best effort). The memory check below shows whether the VMs still fit on N-1.'
             }
         } else {
-            # haMemoryReservedBytes only exists from API revision v4.3 on. Not a finding: the
-            # memory check below is the actual criterion.
-            Add-Check $checks 'HA reservation' INFO 'Not available via API' 'Enabled' "The HA reservation state is only exposed from API v4.3 (this PC: clustermgmt $($script:nsVersion['clustermgmt'])). Check Prism Element > Settings > Manage VM High Availability. The memory check below verifies N-1 independently."
+            # haMemoryReservedBytes only exists from API revision v4.3 on. The engineer
+            # checks the setting in the UI and confirms it; the answer is recorded.
+            $uiPath = 'Prism Element > Settings > Manage VM High Availability > "Enable HA Reservation"'
+            $apiNote = "Not exposed by the API (clustermgmt $($script:nsVersion['clustermgmt']); requires v4.3)."
+            $answer = $null
+            if (-not $NonInteractive) {
+                Write-Host ""
+                Write-Host "  HA reservation on $($cl.name) cannot be read via the API." -ForegroundColor Yellow
+                Write-Host "  Please check in the UI: $uiPath" -ForegroundColor Yellow
+                for ($try = 0; $try -lt 3 -and $answer -notin @('Y', 'N', 'S'); $try++) {
+                    $answer = ([string](Read-Host "  Is HA reservation enabled? [Y]es / [N]o / [S]kip")).Trim().ToUpper()
+                    if ($answer) { $answer = $answer.Substring(0, 1) }
+                }
+            }
+            $stamp = "{0} on {1:yyyy-MM-dd HH:mm}" -f $Engineer, (Get-Date)
+            switch ($answer) {
+                'Y'     { Add-Check $checks 'HA reservation' PASS 'Enabled (confirmed manually)' 'Enabled' "$apiNote Checked in the UI ($uiPath) and confirmed by $stamp." }
+                'N'     { Add-Check $checks 'HA reservation' WARN 'Not enabled (confirmed manually)' 'Enabled' "$apiNote Checked in the UI and reported as not enabled by $stamp. No memory is reserved for a host failure (best effort); the memory check below shows whether the VMs still fit on N-1." }
+                default { Add-Check $checks 'HA reservation' WARN 'Not confirmed' 'Enabled' "$apiNote The setting was not checked during this run$(if ($NonInteractive) { ' (-NonInteractive)' }). Check in the UI: $uiPath." }
+            }
         }
 
         # ===== 5. Memory with N-1 =====
