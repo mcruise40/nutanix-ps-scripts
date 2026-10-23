@@ -281,6 +281,29 @@ function Get-NtnxStats {
     return $out
 }
 
+function Resolve-NtnxCheck {
+    # Resolves an NCC check ID (sdaExtId) to its title and KB article via the system-defined
+    # alert policies. Tries the ID as extId first, then a filter on policyId. Best effort,
+    # cached per run; unresolved IDs are returned without title.
+    param([string]$CheckId)
+    if (-not $script:checkCache) { $script:checkCache = @{} }
+    if ($script:checkCache.ContainsKey($CheckId)) { return $script:checkCache[$CheckId] }
+
+    $pol = $null
+    try {
+        $pol = (Invoke-NtnxV4 -Namespace monitoring -Path "/serviceability/alerts/system-defined-policies/$CheckId").data
+    } catch {
+        try {
+            $f = [uri]::EscapeDataString("policyId eq '$CheckId'")
+            $pol = @((Invoke-NtnxV4 -Namespace monitoring -Path "/serviceability/alerts/system-defined-policies?`$filter=$f").data)[0]
+        } catch { Write-Verbose "Check $CheckId could not be resolved: $($_.Exception.Message)" }
+    }
+    $title = if ($pol.title) { $pol.title } elseif ($pol.name) { $pol.name } else { $null }
+    $r = [pscustomobject]@{ Title = $title; Kb = (@($pol.kbArticles | Where-Object { $_ }) -join ', ') }
+    $script:checkCache[$CheckId] = $r
+    return $r
+}
+
 function Get-NtnxClusterEvents {
     # Events of one cluster in a time window (monitoring/serviceability/events). Tries an
     # OData filter on creationTime first; if rejected, pages newest-first and stops at the
@@ -809,8 +832,29 @@ foreach ($pc in $PcIp) {
                 # The v4 API has no model for NCC check results (the per-check summary is
                 # only sent by email). The report shows what the task itself returns, the
                 # events of the cluster during the run and the alerts raised by it.
+                # completionDetails (observed on PC with monitoring v4.2): status, total, pass,
+                # info, warn, fail, error and detailedSummary = [{ map = { <cat>SdaExtIds =
+                # "id,id,..." } }] listing the check IDs per non-PASS category.
+                $cd = @{}
+                foreach ($kv in @($t.completionDetails | Where-Object { $_.name })) { $cd[$kv.name] = $kv.value }
+                $counts = [ordered]@{}
+                foreach ($k in @('total', 'pass', 'info', 'warn', 'fail', 'error')) { if ($null -ne $cd[$k]) { $counts[$k] = [int]$cd[$k] } }
+                $nccChecks = @()
+                foreach ($entry in @($cd['detailedSummary'] | Where-Object { $null -ne $_ })) {
+                    $map = if ($entry.PSObject.Properties['map']) { $entry.map } else { $entry }
+                    foreach ($p in @($map.PSObject.Properties | Where-Object { $_.Name -like '*SdaExtIds' })) {
+                        $cat = ($p.Name -replace 'SdaExtIds$', '').ToUpper()
+                        foreach ($id in @("$($p.Value)" -split '[,; ]+' | Where-Object { $_ })) {
+                            $info = Resolve-NtnxCheck -CheckId $id
+                            $nccChecks += [pscustomobject]@{ Category = $cat; CheckId = $id; Title = $info.Title; Kb = $info.Kb }
+                        }
+                    }
+                }
+                $order = @{ FAIL = 0; ERROR = 1; WARN = 2; INFO = 3 }
+                $nccChecks = @($nccChecks | Sort-Object @{ Expression = { if ($order.ContainsKey($_.Category)) { $order[$_.Category] } else { 9 } } }, CheckId)
+
                 $details = @()
-                $details += @($t.completionDetails | Where-Object { $_.name } | ForEach-Object { "$($_.name): $($_.value)" })
+                $details += @($t.completionDetails | Where-Object { $_.name -and $_.name -notin @('status', 'total', 'pass', 'info', 'warn', 'fail', 'error', 'detailedSummary') } | ForEach-Object { "$($_.name): $($_.value)" })
                 $details += @($t.subSteps | Where-Object { $_.name } | ForEach-Object { "Step: $($_.name)" })
                 $details += @($t.warnings | Where-Object { $_.message } | ForEach-Object { "Warning: $($_.message)" })
                 $details += @($t.errorMessages | Where-Object { $_.message } | ForEach-Object { "Error: $($_.message)" })
@@ -826,11 +870,30 @@ foreach ($pc in $PcIp) {
                     Recipients = if ($script:nccRecipients) { $script:nccRecipients -join ', ' } else { 'Alert email configuration of Prism Central' }
                     TaskId     = $nt.TaskId
                     Details    = $details
+                    Overall    = $cd['status']
+                    Counts     = $counts
+                    Checks     = $nccChecks
                     Events     = $events
                     NewAlerts  = @()
                 }
                 switch ($t.status) {
-                    'SUCCEEDED' { Add-Check $checks 'NCC health checks' PASS 'Completed' 'Run before upgrade' ("Run {0:yyyy-MM-dd HH:mm} - {1:HH:mm}. Findings are raised as alerts and evaluated below. {2}" -f $nt.Started, $done, $msgs) }
+                    'SUCCEEDED' {
+                        $run = "Run {0:yyyy-MM-dd HH:mm} - {1:HH:mm}." -f $nt.Started, $done
+                        if ($counts.Count) {
+                            $value  = "$($counts['pass'])/$($counts['total']) PASS"
+                            $bad    = @($nccChecks | Where-Object { $_.Category -in @('FAIL', 'ERROR', 'WARN') })
+                            $badCnt = [int]$counts['fail'] + [int]$counts['error'] + [int]$counts['warn']
+                            $sumTxt = ($counts.Keys | Where-Object { $_ -ne 'total' } | ForEach-Object { "$($_.ToUpper()) $($counts[$_])" }) -join ', '
+                            if ($badCnt -gt 0) {
+                                $list = ($bad | Select-Object -First 8 | ForEach-Object { "$($_.Category) $($_.CheckId)$(if ($_.Title) { " $($_.Title)" })" }) -join ' | '
+                                Add-Check $checks 'NCC health checks' WARN $value 'No FAIL/WARN/ERROR' "$run $sumTxt. $list"
+                            } else {
+                                Add-Check $checks 'NCC health checks' PASS $value 'No FAIL/WARN/ERROR' "$run $sumTxt. Details in the NCC section below."
+                            }
+                        } else {
+                            Add-Check $checks 'NCC health checks' PASS 'Completed' 'Run before upgrade' "$run No result summary returned by the task; NCC findings are raised as alerts and evaluated below. $msgs"
+                        }
+                    }
                     'FAILED'    {
                         $hint = if ($msgs -match 'no email configured') { ' -> Run again with -NccReportRecipients <address> or configure the alert email on Prism Central.' } else { '' }
                         Add-Check $checks 'NCC health checks' WARN 'Failed' 'Run before upgrade' "NCC task failed: $msgs$hint"
@@ -972,10 +1035,26 @@ footer{margin-top:32px;color:#7b8794;font-size:12px}
             [void]$sb.Append("<tr><td>Started / completed</td><td>$(HtmlEnc ('{0:yyyy-MM-dd HH:mm:ss} / {1}' -f $n2.Started, $(if ($n2.Completed) { $n2.Completed.ToString('yyyy-MM-dd HH:mm:ss') } else { '-' }))) ($(HtmlEnc $n2.Duration))</td></tr>")
             [void]$sb.Append("<tr><td>Summary sent to</td><td>$(HtmlEnc $n2.Recipients)</td></tr>")
             [void]$sb.Append("<tr><td>Task</td><td>$(HtmlEnc $n2.TaskId)</td></tr>")
+            if ($n2.Counts -and $n2.Counts.Count) {
+                $parts = foreach ($k in $n2.Counts.Keys) {
+                    $cls = switch ($k) { 'pass' { 'pass' } 'info' { 'info' } 'warn' { 'warn' } 'total' { 'skip' } default { if ($n2.Counts[$k] -gt 0) { 'fail' } else { 'skip' } } }
+                    if ($k -eq 'warn' -and $n2.Counts[$k] -eq 0) { $cls = 'skip' }
+                    "<span class='b $cls'>$($k.ToUpper()) $($n2.Counts[$k])</span>"
+                }
+                [void]$sb.Append("<tr><td>Result</td><td>$($parts -join ' ')$(if ($n2.Overall) { " &nbsp;overall: $(HtmlEnc $n2.Overall)" })</td></tr>")
+            }
             foreach ($d in $n2.Details) { [void]$sb.Append("<tr><td>Task detail</td><td>$(HtmlEnc $d)</td></tr>") }
             $newCount = @($n2.NewAlerts).Count
             [void]$sb.Append("<tr><td>Alerts raised during the run</td><td>$newCount (Critical/Warning, included in the checks above)</td></tr>")
-            [void]$sb.Append("<tr><td>Note</td><td>The per-check NCC results are not exposed by the v4 API; they are in the NCC summary sent to the recipients above. Failed checks with alerting enabled appear as alerts.</td></tr></table>")
+            [void]$sb.Append("<tr><td>Note</td><td>Counters and the IDs of all non-PASS checks come from the NCC task. The full NCC report with all check outputs is in the summary sent to the recipients above.</td></tr></table>")
+            if ($n2.Checks) {
+                [void]$sb.Append("<h3 style='font-size:14px;margin:16px 0 6px'>Checks not passed</h3><table><tr><th>Result</th><th>Check ID</th><th>Check</th><th>KB</th></tr>")
+                foreach ($c2 in $n2.Checks) {
+                    $cls = switch ($c2.Category) { 'FAIL' { 'fail' } 'ERROR' { 'fail' } 'WARN' { 'warn' } 'INFO' { 'info' } default { 'skip' } }
+                    [void]$sb.Append("<tr><td><span class='b $cls'>$(HtmlEnc $c2.Category)</span></td><td>$(HtmlEnc $c2.CheckId)</td><td>$(HtmlEnc $(if ($c2.Title) { $c2.Title } else { '(name not available via API)' }))</td><td>$(HtmlEnc $c2.Kb)</td></tr>")
+                }
+                [void]$sb.Append("</table>")
+            }
             if ($n2.NewAlerts) {
                 [void]$sb.Append("<h3 style='font-size:14px;margin:16px 0 6px'>Alerts raised during the NCC run</h3><table><tr><th>Severity</th><th>Title</th><th>Raised</th></tr>")
                 foreach ($a in $n2.NewAlerts) { [void]$sb.Append("<tr><td>$(HtmlEnc $a.Severity)</td><td>$(HtmlEnc $a.Title)</td><td>$(HtmlEnc $a.Created.ToString('yyyy-MM-dd HH:mm'))</td></tr>") }
