@@ -58,3 +58,53 @@ Results are sorted by `MaxReadyPct` descending. The summary objects have more th
 - Whether Nutanix normalizes the value per vCPU (unlike VMware's per-VM summation in vCenter) is not explicitly documented - keep this in mind when comparing with vCenter values.
 - A failure on one VM or one Prism Central produces a warning; the remaining VMs/PCs are still processed.
 - Certificate validation is disabled (`SkipCertificateCheck`), same as the other scripts. Requires PowerShell 7+.
+
+## Get-NtnxClusterCpuPeak.ps1
+
+Reads the **hypervisor CPU usage** of all (or selected) clusters and their hosts from one or more Prism Central instances, determines the **peak** in the evaluation window and projects the cluster peak onto **N-1 hosts** (one host in maintenance or failed). Intended as a pre-check before rolling upgrades.
+
+The projection is `MaxCpuPct × Nodes / (Nodes - 1)`. It assumes homogeneous nodes and an even redistribution of the load; additional CVM load during an upgrade is not included. Read it together with CPU Ready (`Get-NtnxVmCpuReady.ps1`) - CPU usage alone does not show contention.
+
+| Parameter | Description |
+|---|---|
+| `-PcIp` (mandatory) | One or more Prism Central IPs/FQDNs, without `https://` or port. All clusters of each PC are covered |
+| `-Credential` (mandatory) | `PSCredential` for Prism Central (same credential for all PCs) |
+| `-ClusterNames` | Only these cluster(s) (Prism Element cluster name, case-insensitive) |
+| `-Hours` | Look-back window in hours, ending now. Default: `168` (7 days) |
+| `-StartTime` / `-EndTime` | Explicit window (local time) instead of `-Hours` |
+| `-SamplingInterval` | Seconds per data point. Default: `300` (5 min), minimum `30` |
+| `-StatType` | Down-sampling per interval: `MAX` (default), `AVG`, `MIN`, `LAST` |
+| `-ThresholdPercent` | Threshold for the projected N-1 peak (`WARN` status). Default: `80` - rule of thumb, not an official Nutanix value |
+| `-ClusterOnly` | Skip the per-host queries, cluster rows only |
+| `-ApiVersion` | Nutanix v4 API revision. Default: `v4.2`, falls back to `v4.0` |
+| `-CsvPath` | Export to CSV (semicolon-delimited, UTF-8) |
+| `-Raw` | One row per cluster/host and sample instead of the summary |
+
+```powershell
+$creds = Get-Credential
+.\Get-NtnxClusterCpuPeak.ps1 -PcIp 10.0.20.10 -Credential $creds | Format-Table
+.\Get-NtnxClusterCpuPeak.ps1 -PcIp 10.0.20.10,10.1.20.10 -Credential $creds -ClusterOnly -CsvPath .\cpupeak.csv
+.\Get-NtnxClusterCpuPeak.ps1 -PcIp 10.0.20.10 -Credential $creds -ClusterNames "NTNX-CL01" -Hours 24 -SamplingInterval 30 | Format-Table
+.\Get-NtnxClusterCpuPeak.ps1 -PcIp 10.0.20.10 -Credential $creds -ClusterNames "NTNX-CL01" -ClusterOnly -Raw | Format-Table
+```
+
+**Output columns (summary):**
+
+| Column | Meaning |
+|---|---|
+| `Scope` | `Cluster` or `Host`. Each cluster row is followed by its hosts, sorted by peak |
+| `Status` | Cluster rows: `WARN` = projected N-1 peak above `-ThresholdPercent`, `OK`, `SINGLE NODE` or `NO DATA` |
+| `Nodes` | Number of hosts in the cluster |
+| `MaxCpuPct` | Highest CPU usage (%) in the window |
+| `ProjectedN1Pct` | Cluster rows only: peak projected onto N-1 hosts |
+| `MaxCpuAt` | Timestamp (local time) of the peak - useful for choosing the maintenance window |
+| `AvgCpuPct` | Mean of the samples. With `-StatType MAX` this is the mean of the per-interval peaks, not the true average |
+| `Samples` | Number of data points |
+
+**Implementation notes:**
+- Endpoints: `GET /clustermgmt/<ApiVersion>/stats/clusters/{extId}` and `.../stats/clusters/{clusterExtId}/hosts/{hostExtId}` with `$startTime`, `$endTime`, `$samplingInterval`, `$statType`. Field name `hypervisorCpuUsagePpm` is taken from the official Nutanix clustermgmt SDK (`clustermgmt.v4.stats.ClusterStats` / `HostStats`, metrics as `TimeValuePair` arrays).
+- Entity stats via the v4 API require Prism Central pc.2024.1 / AOS 6.8 or later.
+- **Unit:** ppm, converted to percent (`10'000 ppm = 1 %`).
+- The Prism Central self-registration (`clusterFunction` = `PRISM_CENTRAL`) is excluded automatically.
+- `$select` fallback, UTC time window, error handling per cluster/host and PC: same behaviour as `Get-NtnxVmCpuReady.ps1`.
+- Certificate validation is disabled (`SkipCertificateCheck`), same as the other scripts. Requires PowerShell 7+.
