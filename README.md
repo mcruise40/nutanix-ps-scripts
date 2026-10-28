@@ -11,6 +11,9 @@ A collection of PowerShell scripts for operating and managing Nutanix environmen
 │   └── workflows
 │       └── readme-tree.yml
 ├── .gitignore
+├── Inventory
+│   ├── Get-NtnxVmInventory.ps1
+│   └── README.md
 ├── Move
 │   ├── Get-WindowsNutanixVirtIO.ps1
 │   ├── NutanixMove_MultiServerDeployment.ps1
@@ -32,7 +35,7 @@ A collection of PowerShell scripts for operating and managing Nutanix environmen
 │   └── Test-NtnxUpgradeReadiness.ps1
 └── tree.bak
 
-7 directories, 18 files
+8 directories, 20 files
 ```
 <!-- readme-tree end -->
 
