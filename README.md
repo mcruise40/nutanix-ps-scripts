@@ -45,3 +45,4 @@ A collection of PowerShell scripts for operating and managing Nutanix environmen
 - **Performance/** — performance metrics via the Prism Central v4 API (CPU Ready Time per VM, CPU peak per cluster/host with N-1 projection).
 - **Inventory/** — VM asset inventory via the Prism Central v4 API (sizing, guest OS, NGT status, boot/vTPM, network, protection, categories, placement) with CSV export, plus a Nutanix Files inventory (file servers and shares: protocol, usage, AD join, network) with CSV export.
 - **Upgrade/** — pre-upgrade readiness check via the Prism Central v4 API (resources with N-1, NCC, alerts with justification, HTML report for the change).
+- **Veeam/** — Veeam Backup & Replication checks, e.g. verifying restore points for a list of VMs (including Nutanix AHV plug-in backups) before decommissioning them.
